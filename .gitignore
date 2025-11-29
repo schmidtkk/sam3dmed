@@ -1,1 +1,6 @@
 __pycache__
+# Preprocessed data
+nnUNet_preprocessed/
+*.b2nd
+*.pkl
+paper.pdf
