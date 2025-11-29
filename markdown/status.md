@@ -39,14 +39,18 @@ STATUS NOTE — Read before starting implementation
 - [x] Phase 3: Dataset augmentations (`sam3d_objects/data/dataset/ts/slice_augmentations.py`)
 
 ### In Progress
-- [ ] Phase 4: Reprocessing script (`scripts/reprocess_ts_nifti.py`)
+- [x] Phase 4: Reprocessing script (`scripts/reprocess_ts_nifti.py`)
+- [x] Phase 5: TS_SAM3D_Dataset loader finalization
 
-### Not Started
-- [ ] Phase 5: TS_SAM3D_Dataset loader finalization
+### Completed
 - [x] Phase 6: LoRA adapters
   - `sam3d_objects/model/lora.py`: LoRALinear class, inject_lora, freeze_base_params, merge utilities
   - Tests: `tests/test_lora.py` (18 tests pass)
-- [ ] Phase 7: Training harness
+- [x] Phase 7: Training harness
+  - `scripts/train_medical.py`: MedicalTrainer with LoRA, SDF+Chamfer+mesh_reg losses
+  - Tests: `tests/test_train_medical.py` (17 tests pass)
+
+### Not Started
 - [ ] Phase 8: Evaluation pipeline
 - [ ] Phase 9: CI tests
 - [ ] Phase 10: Final review
