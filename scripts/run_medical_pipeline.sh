@@ -123,19 +123,36 @@ if [[ $ONLY_EVAL -eq 0 ]]; then
   # Call the train_medical script directly. This supports --use_dataset to switch
   # to the real dataset loader (TS_SAM3D_Dataset). Using direct CLI keeps the script
   # simple and avoids inline Python.
-  python3 scripts/train_medical.py \
-    --use_dataset \
-    --data_root "$OUT_DIR" \
-    --batch_size "$BATCH_SIZE" \
-    --epochs "$EPOCHS" \
-    --lr "$LR" \
-    --device "$DEVICE" \
-    --checkpoint_dir "$CHECKPOINT_DIR" \
-    --lora_rank "$LORA_RANK" \
-    --lora_alpha "$LORA_ALPHA" \
-    --num_workers "$NUM_WORKERS" \
-    --augment \
-    ${RESUME:+--resume "$RESUME"} || { echo "Training failed"; exit 1; }
+  TRAIN_CMD=(
+    python3
+    scripts/train_medical.py
+    --use_dataset
+    --data_root
+    "$OUT_DIR"
+    --batch_size
+    "$BATCH_SIZE"
+    --epochs
+    "$EPOCHS"
+    --lr
+    "$LR"
+    --device
+    "$DEVICE"
+    --checkpoint_dir
+    "$CHECKPOINT_DIR"
+    --lora_rank
+    "$LORA_RANK"
+    --lora_alpha
+    "$LORA_ALPHA"
+    --num_workers
+    "$NUM_WORKERS"
+    --augment
+  )
+
+  if [[ -n "$RESUME" ]]; then
+    TRAIN_CMD+=(--resume "$RESUME")
+  fi
+
+  "${TRAIN_CMD[@]}" || { echo "Training failed"; exit 1; }
   echo "[Pipeline] Training complete"
 fi
 
