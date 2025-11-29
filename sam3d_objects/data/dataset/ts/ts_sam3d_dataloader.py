@@ -11,22 +11,16 @@ Features implemented:
 
 from __future__ import annotations
 
-import os
-import glob
-import json
 import random
-from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 
-import numpy as np
 import nibabel as nib
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-import torchio as tio
 
 from sam3d_objects.data.dataset.tdfy.preprocessor import PreProcessor
-from sam3d_objects.data.dataset.ts.ts_nnunet_dataloader import TS_nnUNet_Dataset
-from sam3d_objects.data.dataset.ts.slice_augmentations import SliceAugmentor, create_augmentor
+from sam3d_objects.data.dataset.ts.slice_augmentations import create_augmentor
 from utils.sdf_fn import compute_sdf
 
 
@@ -55,11 +49,11 @@ class TS_SAM3D_Dataset(Dataset):
         self,
         original_nifti_dir: str,
         cache_slices: bool = True,
-        slice_cache_dir: Optional[str] = None,
+        slice_cache_dir: str | None = None,
         slice_sampling_method: str = "random_axis",
         num_slices_per_volume: int = 3,
-        preprocess_crop_size: Tuple[int, int] = (256, 256),
-        use_resampled_dir: Optional[str] = None,
+        preprocess_crop_size: tuple[int, int] = (256, 256),
+        use_resampled_dir: str | None = None,
         classes: int = 1,
         augment: bool = True,
         augment_mode: str = "train",
@@ -68,7 +62,7 @@ class TS_SAM3D_Dataset(Dataset):
         **kwargs,
     ):
         """Initialize TS_SAM3D_Dataset.
-        
+
         Args:
             original_nifti_dir: Root directory containing raw NIfTI files
             cache_slices: Whether to cache per-slice .npz files for fast IO
@@ -118,13 +112,13 @@ class TS_SAM3D_Dataset(Dataset):
         else:
             self.file_names = []  # no file names, we will sample on-the-fly
 
-    def _filter_by_occupancy(self, file_paths: List[Path]) -> List[Path]:
+    def _filter_by_occupancy(self, file_paths: list[Path]) -> list[Path]:
         """Filter cached slice files by minimum foreground occupancy."""
         filtered = []
         for fp in file_paths:
             try:
                 data = np.load(str(fp), allow_pickle=True)
-                mask = data['mask']
+                mask = data["mask"]
                 fg_ratio = (mask > 0).sum() / mask.size
                 if fg_ratio >= self.occupancy_threshold:
                     filtered.append(fp)
@@ -137,12 +131,19 @@ class TS_SAM3D_Dataset(Dataset):
         img_candidates = list(self.original_nifti_dir.glob("**/*img*.nii*"))
         if len(img_candidates) == 0:
             # fallback to all .nii* files paired with *_seg or *_mask
-            img_candidates = [p for p in self.original_nifti_dir.glob("**/*.nii*") if not p.name.lower().endswith("_seg.nii.gz")]
+            img_candidates = [
+                p
+                for p in self.original_nifti_dir.glob("**/*.nii*")
+                if not p.name.lower().endswith("_seg.nii.gz")
+            ]
         cases = []
         for img_path in img_candidates:
             mask_path = None
             # heuristic for mask
-            for candidate in (img_path.parent.glob(img_path.stem + "*seg*.nii*"), img_path.parent.glob(img_path.stem + "*mask*.nii*")):
+            for candidate in (
+                img_path.parent.glob(img_path.stem + "*seg*.nii*"),
+                img_path.parent.glob(img_path.stem + "*mask*.nii*"),
+            ):
                 for cm in candidate:
                     mask_path = cm
                     break
@@ -191,7 +192,6 @@ class TS_SAM3D_Dataset(Dataset):
 
             # Extract all slices and save as cache; store metadata about slice sampling
             # We cache all slices by default here; training sampling will pick random ones.
-            D = img.shape[0]
             H, W = img.shape[1], img.shape[2]
             for z in range(img.shape[0]):
                 # For simplicity store axial slices in cache; random axis sampling still possible in on-the-fly
@@ -199,23 +199,40 @@ class TS_SAM3D_Dataset(Dataset):
                 mask_2d = mask[z, :, :]
 
                 # Build pointmap for axial
-                xv, yv = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
+                xv, yv = np.meshgrid(np.arange(W), np.arange(H), indexing="xy")
                 k = np.full_like(xv, z)
                 voxel_coords = np.stack([xv, yv, k, np.ones_like(xv)], axis=-1)
                 world_coords = (affine @ voxel_coords.reshape(-1, 4).T).T.reshape(H, W, 4)[..., :3]
-                xyz_masked = np.where(mask_2d[..., None], world_coords, np.nan).astype(np.float32).transpose(2, 0, 1)
+                xyz_masked = (
+                    np.where(mask_2d[..., None], world_coords, np.nan)
+                    .astype(np.float32)
+                    .transpose(2, 0, 1)
+                )
 
                 # convert image to 3 channels (replicate) and float32
                 image_3ch = np.stack([image_2d, image_2d, image_2d], axis=0).astype(np.float32)
 
                 fname = self.slice_cache_dir / f"{case_id}_slice_{z:03d}.npz"
-                np.savez_compressed(fname, image=image_3ch, mask=mask_2d.astype(np.uint8), pointmap=xyz_masked, affine=affine, slice_idx=z, gt_sdf_path=str(self.slice_cache_dir / f"{case_id}_sdf.npy"))
+                np.savez_compressed(
+                    fname,
+                    image=image_3ch,
+                    mask=mask_2d.astype(np.uint8),
+                    pointmap=xyz_masked,
+                    affine=affine,
+                    slice_idx=z,
+                    gt_sdf_path=str(self.slice_cache_dir / f"{case_id}_sdf.npy"),
+                )
 
     def __len__(self):
         if self.cache_slices:
             return len(self.file_names)
         # if no cache, estimate based on volumes and slices per volume
-        total_slices = sum([img.shape[0] for img, _ in [(nib.load(str(i[0])).get_fdata(), None) for i in self.cases]])
+        total_slices = sum(
+            [
+                img.shape[0]
+                for img, _ in [(nib.load(str(i[0])).get_fdata(), None) for i in self.cases]
+            ]
+        )
         return total_slices
 
     def _sample_slice_on_the_fly(self, case_idx: int):
@@ -261,7 +278,7 @@ class TS_SAM3D_Dataset(Dataset):
 
         # compute pointmap based on axis and affine
         H, W = image_2d.shape
-        xv, yv = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
+        xv, yv = np.meshgrid(np.arange(W), np.arange(H), indexing="xy")
         if axis_choice == 2:
             k = np.full_like(xv, z)
             voxel_coords = np.stack([xv, yv, k, np.ones_like(xv)], axis=-1)
@@ -273,7 +290,9 @@ class TS_SAM3D_Dataset(Dataset):
             voxel_coords = np.stack([yv, k, xv, np.ones_like(xv)], axis=-1)
 
         world_coords = (affine @ voxel_coords.reshape(-1, 4).T).T.reshape(H, W, 4)[..., :3]
-        xyz_masked = np.where(mask_2d[..., None], world_coords, np.nan).astype(np.float32).transpose(2, 0, 1)
+        xyz_masked = (
+            np.where(mask_2d[..., None], world_coords, np.nan).astype(np.float32).transpose(2, 0, 1)
+        )
         image_3ch = np.stack([image_2d, image_2d, image_2d], axis=0).astype(np.float32)
 
         return image_3ch, mask_2d, xyz_masked, affine, z
@@ -282,49 +301,51 @@ class TS_SAM3D_Dataset(Dataset):
         if self.cache_slices:
             file_path = self.file_names[index]
             data = np.load(str(file_path), allow_pickle=True)
-            image = torch.from_numpy(data['image']).float()
-            mask = torch.from_numpy(data['mask']).float()
-            pointmap = torch.from_numpy(data['pointmap']).float()
-            affine = torch.from_numpy(data['affine']).float() if 'affine' in data else torch.eye(4)
-            gt_sdf_path = data['gt_sdf_path'].item() if 'gt_sdf_path' in data else None
+            image = torch.from_numpy(data["image"]).float()
+            mask = torch.from_numpy(data["mask"]).float()
+            pointmap = torch.from_numpy(data["pointmap"]).float()
+            affine = torch.from_numpy(data["affine"]).float() if "affine" in data else torch.eye(4)
+            gt_sdf_path = data["gt_sdf_path"].item() if "gt_sdf_path" in data else None
             gt_sdf = torch.from_numpy(np.load(gt_sdf_path)) if gt_sdf_path is not None else None
             name = file_path.stem
 
             # Apply per-slice augmentations (before PreProcessor)
             aug_result = self.augmentor(image, mask, pointmap)
-            image = aug_result['image']
-            mask = aug_result['mask']
-            pointmap = aug_result['pointmap']
+            image = aug_result["image"]
+            mask = aug_result["mask"]
+            pointmap = aug_result["pointmap"]
 
             # Use PreProcessor for transforms
             pp_return = self.preprocessor._process_image_mask_pointmap_mess(image, mask, pointmap)
             item = {
-                'image': pp_return['image'],
-                'mask': pp_return['mask'],
-                'pointmap': pp_return.get('pointmap', None),
-                'pointmap_scale': pp_return.get('pointmap_scale', None),
-                'pointmap_shift': pp_return.get('pointmap_shift', None),
-                'affine': affine,
-                'mask_sdf': gt_sdf,
-                'name': name
+                "image": pp_return["image"],
+                "mask": pp_return["mask"],
+                "pointmap": pp_return.get("pointmap", None),
+                "pointmap_scale": pp_return.get("pointmap_scale", None),
+                "pointmap_shift": pp_return.get("pointmap_shift", None),
+                "affine": affine,
+                "mask_sdf": gt_sdf,
+                "name": name,
             }
             # Optionally include default identity pose (if requested)
             if self.include_pose:
                 # PoseTarget fields following ScaleShiftInvariant convention
-                item['pose_target'] = {
-                    'x_instance_scale': torch.ones(1, 1, 3),
-                    'x_instance_rotation': torch.tensor([1.0, 0.0, 0.0, 0.0]),
-                    'x_instance_translation': torch.zeros(1, 1, 3),
-                    'x_scene_scale': torch.ones(1, 1, 3),
-                    'x_scene_center': torch.zeros(1, 1, 3),
-                    'x_translation_scale': torch.ones(1, 1, 1),
-                    'pose_target_convention': 'ScaleShiftInvariant'
+                item["pose_target"] = {
+                    "x_instance_scale": torch.ones(1, 1, 3),
+                    "x_instance_rotation": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+                    "x_instance_translation": torch.zeros(1, 1, 3),
+                    "x_scene_scale": torch.ones(1, 1, 3),
+                    "x_scene_center": torch.zeros(1, 1, 3),
+                    "x_translation_scale": torch.ones(1, 1, 1),
+                    "pose_target_convention": "ScaleShiftInvariant",
                 }
             return item
         else:
             # sample on-the-fly from volumes: index maps into which volume and which slice
             case_idx = index % len(self.cases)
-            image_3ch, mask_2d, pointmap, affine, slice_idx = self._sample_slice_on_the_fly(case_idx)
+            image_3ch, mask_2d, pointmap, affine, slice_idx = self._sample_slice_on_the_fly(
+                case_idx
+            )
             image = torch.from_numpy(image_3ch).float()
             mask = torch.from_numpy(mask_2d).float()
             pointmap = torch.from_numpy(pointmap).float()
@@ -332,72 +353,80 @@ class TS_SAM3D_Dataset(Dataset):
 
             # Apply per-slice augmentations (before PreProcessor)
             aug_result = self.augmentor(image, mask, pointmap)
-            image = aug_result['image']
-            mask = aug_result['mask']
-            pointmap = aug_result['pointmap']
+            image = aug_result["image"]
+            mask = aug_result["mask"]
+            pointmap = aug_result["pointmap"]
 
             # mix transforms via PreProcessor
             pp_return = self.preprocessor._process_image_mask_pointmap_mess(image, mask, pointmap)
             item = {
-                'image': pp_return['image'],
-                'mask': pp_return['mask'],
-                'pointmap': pp_return.get('pointmap', None),
-                'pointmap_scale': pp_return.get('pointmap_scale', None),
-                'pointmap_shift': pp_return.get('pointmap_shift', None),
-                'affine': affine,
-                'mask_sdf': None,
-                'name': f"{self.cases[case_idx][0].stem}_slice_{slice_idx:03d}"
+                "image": pp_return["image"],
+                "mask": pp_return["mask"],
+                "pointmap": pp_return.get("pointmap", None),
+                "pointmap_scale": pp_return.get("pointmap_scale", None),
+                "pointmap_shift": pp_return.get("pointmap_shift", None),
+                "affine": affine,
+                "mask_sdf": None,
+                "name": f"{self.cases[case_idx][0].stem}_slice_{slice_idx:03d}",
             }
             if self.include_pose:
-                item['pose_target'] = {
-                    'x_instance_scale': torch.ones(1, 1, 3),
-                    'x_instance_rotation': torch.tensor([1.0, 0.0, 0.0, 0.0]),
-                    'x_instance_translation': torch.zeros(1, 1, 3),
-                    'x_scene_scale': torch.ones(1, 1, 3),
-                    'x_scene_center': torch.zeros(1, 1, 3),
-                    'x_translation_scale': torch.ones(1, 1, 1),
-                    'pose_target_convention': 'ScaleShiftInvariant'
+                item["pose_target"] = {
+                    "x_instance_scale": torch.ones(1, 1, 3),
+                    "x_instance_rotation": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+                    "x_instance_translation": torch.zeros(1, 1, 3),
+                    "x_scene_scale": torch.ones(1, 1, 3),
+                    "x_scene_center": torch.zeros(1, 1, 3),
+                    "x_translation_scale": torch.ones(1, 1, 1),
+                    "pose_target_convention": "ScaleShiftInvariant",
                 }
             return item
 
 
 # collate function similar to TS loader
 def data_collate(batch):
-    img = torch.stack([item['image'] for item in batch])
-    mask_sdf = torch.stack([item['mask_sdf'] if item['mask_sdf'] is not None else torch.zeros((1, 1, 1)) for item in batch])
-    segmentation = torch.stack([item['mask'] for item in batch])
-    name = [item['name'] for item in batch]
+    img = torch.stack([item["image"] for item in batch])
+    mask_sdf = torch.stack(
+        [
+            item["mask_sdf"] if item["mask_sdf"] is not None else torch.zeros((1, 1, 1))
+            for item in batch
+        ]
+    )
+    segmentation = torch.stack([item["mask"] for item in batch])
+    name = [item["name"] for item in batch]
 
     affine_tensors = []
     for item in batch:
-        affine_value = item['affine']
+        affine_value = item["affine"]
         if not isinstance(affine_value, torch.Tensor):
             affine_value = torch.from_numpy(np.asarray(affine_value)).float()
         affine_tensors.append(affine_value)
     affine = torch.stack(affine_tensors)
 
     batch_dict = {
-        'image': img.float(),
-        'mask_sdf': mask_sdf.float(),
-        'segmentation': segmentation,
-        'name': name,
-        'affine': affine,
+        "image": img.float(),
+        "mask_sdf": mask_sdf.float(),
+        "segmentation": segmentation,
+        "name": name,
+        "affine": affine,
     }
     # optional pose targets
-    if 'pose_target' in batch[0]:
+    if "pose_target" in batch[0]:
         # create a dictionary of stacked fields
-        pose_keys = list(batch[0]['pose_target'].keys())
+        pose_keys = list(batch[0]["pose_target"].keys())
         stacked_pose = {}
         for k in pose_keys:
-            stacked_pose[k] = torch.stack([item['pose_target'][k] for item in batch], dim=0)
-        batch_dict['pose_target'] = stacked_pose
+            stacked_pose[k] = torch.stack([item["pose_target"][k] for item in batch], dim=0)
+        batch_dict["pose_target"] = stacked_pose
     return batch_dict
 
 
 if __name__ == "__main__":
     # Quick sanity test / small run
-    ds = TS_SAM3D_Dataset(original_nifti_dir="/mnt/nas1/disk01/weidongguo/dataset/TS", cache_slices=True, classes=5)
+    ds = TS_SAM3D_Dataset(
+        original_nifti_dir="/mnt/nas1/disk01/weidongguo/dataset/TS", cache_slices=True, classes=5
+    )
     from torch.utils.data import DataLoader
+
     loader = DataLoader(ds, batch_size=2, shuffle=True, collate_fn=data_collate)
     batch = next(iter(loader))
     print({k: (v.shape if isinstance(v, torch.Tensor) else type(v)) for k, v in batch.items()})

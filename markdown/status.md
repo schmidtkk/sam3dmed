@@ -50,13 +50,17 @@ STATUS NOTE — Read before starting implementation
   - `scripts/train_medical.py`: MedicalTrainer with LoRA, SDF+Chamfer+mesh_reg losses
   - Tests: `tests/test_train_medical.py` (17 tests pass)
 
-### Not Started
-- [ ] Phase 9: CI tests
-- [ ] Phase 10: Final review
-
 ### Completed
 - [x] Phase 8: Evaluation pipeline
   - `scripts/eval_medical.py`: MedicalEvaluator with Dice, HD95, Chamfer metrics
   - Tests: `tests/test_eval_medical.py` (14 tests pass)
+- [x] Phase 9: CI configuration
+  - `.github/workflows/test.yml`: GitHub Actions for linting and testing
+  - `pyproject.toml`: pytest + ruff + coverage configuration
+  - `tests/conftest.py`: Shared test fixtures
+  - All 69 tests pass, ruff linting clean
+
+### Not Started
+- [ ] Phase 10: Final review
 
 Follow these settings unless an experiment requires change; update this file to reflect changes in defaults.

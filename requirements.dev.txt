@@ -1,4 +1,6 @@
 pytest
+pytest-cov
+ruff
 findpydeps
 pipdeptree
 lovely_tensors

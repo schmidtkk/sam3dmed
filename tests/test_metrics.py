@@ -1,5 +1,6 @@
 import numpy as np
-from sam3d_objects.utils.metrics import compute_dice, compute_chamfer, compute_hd95
+
+from sam3d_objects.utils.metrics import compute_chamfer, compute_dice, compute_hd95
 
 
 def test_dice_identical():

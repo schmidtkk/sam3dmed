@@ -13,21 +13,18 @@ Usage:
         --lr 1e-3
 """
 
-import os
-import sys
 import argparse
 import json
-from datetime import datetime
+import sys
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from loguru import logger
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.data import DataLoader
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,14 +33,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 class MedicalTrainingLosses(nn.Module):
     """
     Combined loss functions for medical mesh training.
-    
+
     Supports:
     - SDF loss (L1/MSE on predicted vs GT SDF)
     - Chamfer distance loss on mesh vertices
     - Mesh regularization (Laplacian smoothing, edge length)
     - Occupancy/mask loss
     """
-    
+
     def __init__(
         self,
         sdf_weight: float = 1.0,
@@ -58,27 +55,28 @@ class MedicalTrainingLosses(nn.Module):
         self.mesh_reg_weight = mesh_reg_weight
         self.occupancy_weight = occupancy_weight
         self.sdf_loss_type = sdf_loss_type
-        
+
         # Import metrics lazily to avoid import errors
         self._chamfer_fn = None
-    
+
     @property
     def chamfer_fn(self):
         """Lazy load chamfer function."""
         if self._chamfer_fn is None:
             from sam3d_objects.utils.metrics import compute_chamfer
+
             self._chamfer_fn = compute_chamfer
         return self._chamfer_fn
-    
+
     def compute_sdf_loss(
         self,
         pred_sdf: torch.Tensor,
         gt_sdf: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute SDF reconstruction loss.
-        
+
         Args:
             pred_sdf: Predicted SDF values (B, D, H, W) or (B, C, D, H, W)
             gt_sdf: Ground truth SDF values
@@ -88,12 +86,12 @@ class MedicalTrainingLosses(nn.Module):
             loss = F.l1_loss(pred_sdf, gt_sdf, reduction="none")
         else:
             loss = F.mse_loss(pred_sdf, gt_sdf, reduction="none")
-        
+
         if mask is not None:
             loss = loss * mask
             return loss.sum() / (mask.sum() + 1e-8)
         return loss.mean()
-    
+
     def compute_chamfer_loss(
         self,
         pred_vertices: torch.Tensor,
@@ -101,13 +99,13 @@ class MedicalTrainingLosses(nn.Module):
     ) -> torch.Tensor:
         """
         Compute Chamfer distance between predicted and GT mesh vertices.
-        
+
         Args:
             pred_vertices: Predicted vertex positions (N, 3)
             gt_vertices: Ground truth vertex positions (M, 3)
         """
         return self.chamfer_fn(pred_vertices, gt_vertices)
-    
+
     def compute_mesh_regularization(
         self,
         vertices: torch.Tensor,
@@ -115,7 +113,7 @@ class MedicalTrainingLosses(nn.Module):
     ) -> torch.Tensor:
         """
         Compute mesh regularization loss (Laplacian smoothing + edge length).
-        
+
         Args:
             vertices: Mesh vertices (V, 3)
             faces: Mesh faces (F, 3)
@@ -124,18 +122,20 @@ class MedicalTrainingLosses(nn.Module):
         v0 = vertices[faces[:, 0]]
         v1 = vertices[faces[:, 1]]
         v2 = vertices[faces[:, 2]]
-        
-        edge_lengths = torch.cat([
-            (v0 - v1).norm(dim=-1),
-            (v1 - v2).norm(dim=-1),
-            (v2 - v0).norm(dim=-1),
-        ])
-        
+
+        edge_lengths = torch.cat(
+            [
+                (v0 - v1).norm(dim=-1),
+                (v1 - v2).norm(dim=-1),
+                (v2 - v0).norm(dim=-1),
+            ]
+        )
+
         # Penalize variance in edge lengths (encourages uniform triangles)
         edge_reg = edge_lengths.var()
-        
+
         return edge_reg
-    
+
     def compute_occupancy_loss(
         self,
         pred_occupancy: torch.Tensor,
@@ -143,60 +143,60 @@ class MedicalTrainingLosses(nn.Module):
     ) -> torch.Tensor:
         """
         Compute binary occupancy loss.
-        
+
         Args:
             pred_occupancy: Predicted occupancy (logits or probabilities)
             gt_occupancy: Ground truth occupancy (binary)
         """
         return F.binary_cross_entropy_with_logits(pred_occupancy, gt_occupancy.float())
-    
+
     def forward(
         self,
-        pred_sdf: Optional[torch.Tensor] = None,
-        gt_sdf: Optional[torch.Tensor] = None,
-        pred_vertices: Optional[torch.Tensor] = None,
-        gt_vertices: Optional[torch.Tensor] = None,
-        pred_faces: Optional[torch.Tensor] = None,
-        pred_occupancy: Optional[torch.Tensor] = None,
-        gt_occupancy: Optional[torch.Tensor] = None,
-        sdf_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        pred_sdf: torch.Tensor | None = None,
+        gt_sdf: torch.Tensor | None = None,
+        pred_vertices: torch.Tensor | None = None,
+        gt_vertices: torch.Tensor | None = None,
+        pred_faces: torch.Tensor | None = None,
+        pred_occupancy: torch.Tensor | None = None,
+        gt_occupancy: torch.Tensor | None = None,
+        sdf_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """
         Compute all losses.
-        
+
         Returns:
             Dict with individual losses and total loss
         """
         losses = {}
         total_loss = torch.tensor(0.0, device=self._get_device(pred_sdf, pred_vertices))
-        
+
         # SDF loss
         if pred_sdf is not None and gt_sdf is not None:
             sdf_loss = self.compute_sdf_loss(pred_sdf, gt_sdf, sdf_mask)
             losses["sdf"] = sdf_loss
             total_loss = total_loss + self.sdf_weight * sdf_loss
-        
+
         # Chamfer loss
         if pred_vertices is not None and gt_vertices is not None:
             chamfer_loss = self.compute_chamfer_loss(pred_vertices, gt_vertices)
             losses["chamfer"] = chamfer_loss
             total_loss = total_loss + self.chamfer_weight * chamfer_loss
-        
+
         # Mesh regularization
         if pred_vertices is not None and pred_faces is not None:
             mesh_reg = self.compute_mesh_regularization(pred_vertices, pred_faces)
             losses["mesh_reg"] = mesh_reg
             total_loss = total_loss + self.mesh_reg_weight * mesh_reg
-        
+
         # Occupancy loss
         if pred_occupancy is not None and gt_occupancy is not None:
             occ_loss = self.compute_occupancy_loss(pred_occupancy, gt_occupancy)
             losses["occupancy"] = occ_loss
             total_loss = total_loss + self.occupancy_weight * occ_loss
-        
+
         losses["total"] = total_loss
         return losses
-    
+
     def _get_device(self, *tensors) -> torch.device:
         """Get device from first non-None tensor."""
         for t in tensors:
@@ -208,19 +208,19 @@ class MedicalTrainingLosses(nn.Module):
 class MedicalTrainer:
     """
     Trainer for medical fine-tuning of SAM3D.
-    
+
     Handles:
     - LoRA injection and parameter freezing
     - Training loop with gradient accumulation
     - Validation and checkpointing
     - Logging and metrics tracking
     """
-    
+
     def __init__(
         self,
         model: nn.Module,
         train_loader: DataLoader,
-        val_loader: Optional[DataLoader] = None,
+        val_loader: DataLoader | None = None,
         lr: float = 1e-3,
         weight_decay: float = 0.01,
         lora_rank: int = 4,
@@ -229,7 +229,7 @@ class MedicalTrainer:
         grad_accum_steps: int = 1,
         mixed_precision: bool = True,
         device: str = "cuda",
-        loss_config: Optional[Dict] = None,
+        loss_config: dict | None = None,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -242,37 +242,37 @@ class MedicalTrainer:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.grad_accum_steps = grad_accum_steps
         self.mixed_precision = mixed_precision
-        
+
         # Setup checkpoint directory
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Setup losses
         loss_config = loss_config or {}
         self.losses = MedicalTrainingLosses(**loss_config)
-        
+
         # Setup LoRA
         self._setup_lora()
-        
+
         # Setup optimizer (only for trainable params)
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
-        
+
         # Setup scheduler (will be configured per training run)
         self.scheduler = None
-        
+
         # Mixed precision scaler
-        self.scaler = torch.amp.GradScaler('cuda') if mixed_precision else None
-        
+        self.scaler = torch.amp.GradScaler("cuda") if mixed_precision else None
+
         # Training state
         self.global_step = 0
         self.current_epoch = 0
         self.best_val_loss = float("inf")
         self.history = {"train": [], "val": []}
-    
+
     def _setup_lora(self) -> None:
         """Inject LoRA and freeze base parameters."""
         from sam3d_objects.model.lora import setup_lora_for_medical_finetuning
-        
+
         param_counts = setup_lora_for_medical_finetuning(
             self.model,
             rank=self.lora_rank,
@@ -280,33 +280,33 @@ class MedicalTrainer:
             dropout=0.0,
             unfreeze_output_layers=True,
         )
-        
-        logger.info(f"LoRA setup complete:")
+
+        logger.info("LoRA setup complete:")
         logger.info(f"  Total params: {param_counts['total']:,}")
         logger.info(f"  Trainable params: {param_counts['trainable']:,}")
         logger.info(f"  LoRA params: {param_counts['lora']:,}")
-    
-    def train_epoch(self) -> Dict[str, float]:
+
+    def train_epoch(self) -> dict[str, float]:
         """Run one training epoch."""
         self.model.train()
         epoch_losses = []
-        
+
         for batch_idx, batch in enumerate(self.train_loader):
             # Move batch to device
             batch = self._to_device(batch)
-            
+
             # Forward pass with mixed precision
-            with torch.amp.autocast('cuda', enabled=self.mixed_precision):
+            with torch.amp.autocast("cuda", enabled=self.mixed_precision):
                 outputs = self._forward_step(batch)
                 losses = self._compute_losses(outputs, batch)
                 loss = losses["total"] / self.grad_accum_steps
-            
+
             # Backward pass
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
+
             # Gradient accumulation
             if (batch_idx + 1) % self.grad_accum_steps == 0:
                 if self.scaler is not None:
@@ -314,17 +314,17 @@ class MedicalTrainer:
                     self.scaler.update()
                 else:
                     self.optimizer.step()
-                
+
                 self.optimizer.zero_grad()
-                
+
                 if self.scheduler is not None:
                     self.scheduler.step()
-                
+
                 self.global_step += 1
-            
+
             # Record losses
             epoch_losses.append({k: v.item() for k, v in losses.items()})
-            
+
             # Log progress
             if (batch_idx + 1) % 10 == 0:
                 logger.info(
@@ -332,36 +332,36 @@ class MedicalTrainer:
                     f"Step {batch_idx + 1}/{len(self.train_loader)} | "
                     f"Loss: {losses['total'].item():.4f}"
                 )
-        
+
         # Aggregate epoch losses
         avg_losses = self._aggregate_losses(epoch_losses)
         self.history["train"].append(avg_losses)
-        
+
         return avg_losses
-    
+
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
+    def validate(self) -> dict[str, float]:
         """Run validation."""
         if self.val_loader is None:
             return {}
-        
+
         self.model.eval()
         val_losses = []
-        
+
         for batch in self.val_loader:
             batch = self._to_device(batch)
-            
-            with torch.amp.autocast('cuda', enabled=self.mixed_precision):
+
+            with torch.amp.autocast("cuda", enabled=self.mixed_precision):
                 outputs = self._forward_step(batch)
                 losses = self._compute_losses(outputs, batch)
-            
+
             val_losses.append({k: v.item() for k, v in losses.items()})
-        
+
         avg_losses = self._aggregate_losses(val_losses)
         self.history["val"].append(avg_losses)
-        
+
         return avg_losses
-    
+
     def train(
         self,
         epochs: int,
@@ -370,7 +370,7 @@ class MedicalTrainer:
     ) -> None:
         """
         Full training loop.
-        
+
         Args:
             epochs: Number of epochs
             save_every: Save checkpoint every N epochs
@@ -385,64 +385,64 @@ class MedicalTrainer:
             pct_start=0.1,
             anneal_strategy="cos",
         )
-        
+
         logger.info(f"Starting training for {epochs} epochs")
         logger.info(f"Total steps: {total_steps}")
-        
+
         for epoch in range(epochs):
             self.current_epoch = epoch + 1
-            logger.info(f"\n{'='*50}")
+            logger.info(f"\n{'=' * 50}")
             logger.info(f"Epoch {self.current_epoch}/{epochs}")
-            logger.info(f"{'='*50}")
-            
+            logger.info(f"{'=' * 50}")
+
             # Train
             train_losses = self.train_epoch()
             logger.info(f"Train Loss: {train_losses['total']:.4f}")
-            
+
             # Validate
             if self.val_loader is not None and epoch % validate_every == 0:
                 val_losses = self.validate()
                 logger.info(f"Val Loss: {val_losses['total']:.4f}")
-                
+
                 # Save best model
                 if val_losses["total"] < self.best_val_loss:
                     self.best_val_loss = val_losses["total"]
                     self.save_checkpoint("best.pt")
-                    logger.info(f"New best model saved!")
-            
+                    logger.info("New best model saved!")
+
             # Periodic checkpoint
             if (epoch + 1) % save_every == 0:
                 self.save_checkpoint(f"epoch_{epoch + 1}.pt")
-        
+
         # Final save
         self.save_checkpoint("final.pt")
         self._save_history()
         logger.info("Training complete!")
-    
-    def _forward_step(self, batch: Dict) -> Dict:
+
+    def _forward_step(self, batch: dict) -> dict:
         """
         Forward pass through model.
-        
+
         Override this method for custom model architectures.
         """
         # Extract inputs
         image = batch.get("image")
         pointmap = batch.get("pointmap")
-        
+
         # Forward pass (model-specific)
         # This is a placeholder - actual implementation depends on model
         outputs = self.model(image, pointmap)
-        
+
         return outputs
-    
+
     def _compute_losses(
         self,
-        outputs: Dict,
-        batch: Dict,
-    ) -> Dict[str, torch.Tensor]:
+        outputs: dict,
+        batch: dict,
+    ) -> dict[str, torch.Tensor]:
         """
         Compute losses from model outputs and batch.
-        
+
         Override this method for custom loss computation.
         """
         # Extract predictions
@@ -450,12 +450,12 @@ class MedicalTrainer:
         pred_vertices = outputs.get("vertices")
         pred_faces = outputs.get("faces")
         pred_occupancy = outputs.get("occupancy")
-        
+
         # Extract ground truth
         gt_sdf = batch.get("sdf")
         gt_vertices = batch.get("vertices")
         gt_occupancy = batch.get("mask")
-        
+
         return self.losses(
             pred_sdf=pred_sdf,
             gt_sdf=gt_sdf,
@@ -465,25 +465,24 @@ class MedicalTrainer:
             pred_occupancy=pred_occupancy,
             gt_occupancy=gt_occupancy,
         )
-    
-    def _to_device(self, batch: Dict) -> Dict:
+
+    def _to_device(self, batch: dict) -> dict:
         """Move batch tensors to device."""
         return {
-            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()
         }
-    
-    def _aggregate_losses(self, losses_list: List[Dict]) -> Dict[str, float]:
+
+    def _aggregate_losses(self, losses_list: list[dict]) -> dict[str, float]:
         """Aggregate list of loss dicts into means."""
         aggregated = {}
         for key in losses_list[0].keys():
             aggregated[key] = sum(d[key] for d in losses_list) / len(losses_list)
         return aggregated
-    
+
     def save_checkpoint(self, filename: str) -> None:
         """Save training checkpoint."""
         from sam3d_objects.model.lora import get_lora_state_dict
-        
+
         checkpoint = {
             "epoch": self.current_epoch,
             "global_step": self.global_step,
@@ -496,32 +495,32 @@ class MedicalTrainer:
                 "lr": self.lr,
             },
         }
-        
+
         if self.scheduler is not None:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
-        
+
         path = self.checkpoint_dir / filename
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved: {path}")
-    
+
     def load_checkpoint(self, path: str) -> None:
         """Load training checkpoint."""
         from sam3d_objects.model.lora import load_lora_state_dict
-        
+
         checkpoint = torch.load(path, map_location=self.device)
-        
+
         load_lora_state_dict(self.model, checkpoint["lora_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        
+
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        
+
         self.current_epoch = checkpoint["epoch"]
         self.global_step = checkpoint["global_step"]
         self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        
+
         logger.info(f"Checkpoint loaded from {path}")
-    
+
     def _save_history(self) -> None:
         """Save training history to JSON."""
         path = self.checkpoint_dir / "history.json"
@@ -532,7 +531,7 @@ class MedicalTrainer:
 
 def create_dummy_model():
     """Create a dummy model for testing."""
-    
+
     class DummyMeshModel(nn.Module):
         def __init__(self, channels: int = 64):
             super().__init__()
@@ -541,11 +540,11 @@ def create_dummy_model():
             self.to_out = nn.Linear(channels, channels)
             self.sdf_head = nn.Linear(channels, 1)
             self.out_layer = nn.Linear(channels, channels)
-        
+
         def forward(self, image, pointmap):
             # Dummy forward
             x = self.embed(pointmap)
-            x = self.to_out(self.to_qkv(x)[..., :x.shape[-1]])
+            x = self.to_out(self.to_qkv(x)[..., : x.shape[-1]])
             x = self.out_layer(x)
             sdf = self.sdf_head(x)
             return {
@@ -554,64 +553,66 @@ def create_dummy_model():
                 "faces": None,
                 "occupancy": None,
             }
-    
+
     return DummyMeshModel()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Medical fine-tuning for SAM3D")
-    
+
     # Data
     parser.add_argument("--data_root", type=str, required=True, help="Path to preprocessed data")
     parser.add_argument("--val_split", type=float, default=0.1, help="Validation split ratio")
-    
+
     # Training
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
-    
+
     # LoRA
     parser.add_argument("--lora_rank", type=int, default=4, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=float, default=8.0, help="LoRA alpha")
-    
+
     # Loss weights
     parser.add_argument("--sdf_weight", type=float, default=1.0, help="SDF loss weight")
     parser.add_argument("--chamfer_weight", type=float, default=0.5, help="Chamfer loss weight")
     parser.add_argument("--mesh_reg_weight", type=float, default=0.1, help="Mesh reg weight")
-    
+
     # Checkpointing
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/medical", help="Checkpoint directory")
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default="./checkpoints/medical", help="Checkpoint directory"
+    )
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--save_every", type=int, default=5, help="Save checkpoint every N epochs")
-    
+
     # Hardware
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--no_mixed_precision", action="store_true", help="Disable mixed precision")
-    
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    
+
     # Setup logging
-    logger.info(f"Medical Fine-Tuning Script")
+    logger.info("Medical Fine-Tuning Script")
     logger.info(f"Args: {args}")
-    
+
     # Create dummy data for now
     # TODO: Replace with actual data loading
     logger.info("Creating dummy data loaders...")
     from torch.utils.data import TensorDataset
-    
+
     dummy_images = torch.randn(100, 1, 256, 256)
     dummy_pointmaps = torch.randn(100, 256, 256, 3)
     dummy_sdfs = torch.randn(100, 1, 64, 64, 64)
     dummy_masks = (torch.rand(100, 64, 64, 64) > 0.5).float()
-    
+
     train_dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
-    
+
     def collate_fn(batch):
         images, pointmaps, sdfs, masks = zip(*batch)
         return {
@@ -620,7 +621,7 @@ def main():
             "sdf": torch.stack(sdfs),
             "mask": torch.stack(masks),
         }
-    
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -628,11 +629,11 @@ def main():
         collate_fn=collate_fn,
         num_workers=0,
     )
-    
+
     # Create model
     logger.info("Creating dummy model...")
     model = create_dummy_model()
-    
+
     # Create trainer
     trainer = MedicalTrainer(
         model=model,
@@ -652,11 +653,11 @@ def main():
             "mesh_reg_weight": args.mesh_reg_weight,
         },
     )
-    
+
     # Resume if specified
     if args.resume:
         trainer.load_checkpoint(args.resume)
-    
+
     # Train
     trainer.train(
         epochs=args.epochs,

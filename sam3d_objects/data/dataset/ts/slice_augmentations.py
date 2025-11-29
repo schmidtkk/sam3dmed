@@ -13,10 +13,8 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any
+from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -24,20 +22,21 @@ import torch.nn.functional as F
 @dataclass
 class SliceAugmentorConfig:
     """Configuration for per-slice augmentations."""
+
     enable: bool = True
     p: float = 0.5  # probability of applying any augmentation
 
     # Geometric transforms
     rotation_range: float = 15.0  # degrees, symmetric around 0
-    scale_range: Tuple[float, float] = (0.9, 1.1)
-    translation_range: Tuple[float, float] = (-0.1, 0.1)  # fraction of image size
+    scale_range: tuple[float, float] = (0.9, 1.1)
+    translation_range: tuple[float, float] = (-0.1, 0.1)  # fraction of image size
     flip_horizontal: bool = True
     flip_vertical: bool = False
 
     # Intensity transforms (image only)
-    brightness_range: Tuple[float, float] = (-0.1, 0.1)
-    contrast_range: Tuple[float, float] = (0.9, 1.1)
-    gamma_range: Tuple[float, float] = (0.9, 1.1)
+    brightness_range: tuple[float, float] = (-0.1, 0.1)
+    contrast_range: tuple[float, float] = (0.9, 1.1)
+    gamma_range: tuple[float, float] = (0.9, 1.1)
     noise_std: float = 0.02
 
 
@@ -49,7 +48,7 @@ class SliceAugmentor:
     NaN values in pointmap are preserved throughout.
     """
 
-    def __init__(self, config: Optional[SliceAugmentorConfig] = None, **kwargs):
+    def __init__(self, config: SliceAugmentorConfig | None = None, **kwargs):
         if config is not None:
             self.config = config
         else:
@@ -60,7 +59,7 @@ class SliceAugmentor:
         image: torch.Tensor,
         mask: torch.Tensor,
         pointmap: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """Apply augmentations.
 
         Args:
@@ -72,7 +71,7 @@ class SliceAugmentor:
             dict with 'image', 'mask', 'pointmap' keys
         """
         if not self.config.enable or random.random() > self.config.p:
-            return {'image': image, 'mask': mask, 'pointmap': pointmap}
+            return {"image": image, "mask": mask, "pointmap": pointmap}
 
         # Sample geometric parameters
         angle = random.uniform(-self.config.rotation_range, self.config.rotation_range)
@@ -83,26 +82,31 @@ class SliceAugmentor:
         flip_v = self.config.flip_vertical and random.random() < 0.5
 
         # Apply geometric transforms
-        image_out = self._apply_geometric(image, angle, scale, tx, ty, flip_h, flip_v, mode='bilinear')
-        mask_out = self._apply_geometric(mask.unsqueeze(0), angle, scale, tx, ty, flip_h, flip_v, mode='nearest').squeeze(0)
-        pointmap_out = self._apply_geometric_pointmap(pointmap, angle, scale, tx, ty, flip_h, flip_v)
+        image_out = self._apply_geometric(
+            image, angle, scale, tx, ty, flip_h, flip_v, mode="bilinear"
+        )
+        mask_out = self._apply_geometric(
+            mask.unsqueeze(0), angle, scale, tx, ty, flip_h, flip_v, mode="nearest"
+        ).squeeze(0)
+        pointmap_out = self._apply_geometric_pointmap(
+            pointmap, angle, scale, tx, ty, flip_h, flip_v
+        )
 
         # Apply intensity transforms to image only
         image_out = self._apply_intensity(image_out)
 
-        return {'image': image_out, 'mask': mask_out, 'pointmap': pointmap_out}
+        return {"image": image_out, "mask": mask_out, "pointmap": pointmap_out}
 
-    def _get_rotation_matrix(self, angle: float, scale: float, tx: float, ty: float) -> torch.Tensor:
+    def _get_rotation_matrix(
+        self, angle: float, scale: float, tx: float, ty: float
+    ) -> torch.Tensor:
         """Build 2x3 affine matrix for rotation, scale, and translation."""
         theta = math.radians(angle)
         cos_t = math.cos(theta) * scale
         sin_t = math.sin(theta) * scale
         # Standard affine matrix (rotation + scale + translation)
         # Note: grid_sample uses normalized coordinates [-1, 1]
-        matrix = torch.tensor([
-            [cos_t, -sin_t, tx],
-            [sin_t, cos_t, ty]
-        ], dtype=torch.float32)
+        matrix = torch.tensor([[cos_t, -sin_t, tx], [sin_t, cos_t, ty]], dtype=torch.float32)
         return matrix
 
     def _apply_geometric(
@@ -114,7 +118,7 @@ class SliceAugmentor:
         ty: float,
         flip_h: bool,
         flip_v: bool,
-        mode: str = 'bilinear',
+        mode: str = "bilinear",
     ) -> torch.Tensor:
         """Apply geometric transform to a tensor.
 
@@ -142,7 +146,7 @@ class SliceAugmentor:
         tensor = tensor.unsqueeze(0)  # (1, C, H, W)
 
         grid = F.affine_grid(matrix, tensor.size(), align_corners=False)
-        output = F.grid_sample(tensor, grid, mode=mode, padding_mode='zeros', align_corners=False)
+        output = F.grid_sample(tensor, grid, mode=mode, padding_mode="zeros", align_corners=False)
 
         return output.squeeze(0)
 
@@ -196,31 +200,29 @@ class SliceAugmentor:
         nan_mask = nan_mask.unsqueeze(0).unsqueeze(0).float()
 
         grid = F.affine_grid(matrix, pointmap_filled.size(), align_corners=False)
-        pointmap_out = F.grid_sample(pointmap_filled, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        pointmap_out = F.grid_sample(
+            pointmap_filled, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+        )
         # For mask, use 'zeros' and then invert logic - pixels outside valid region become NaN
-        mask_out = F.grid_sample(1.0 - nan_mask, grid, mode='nearest', padding_mode='zeros', align_corners=False)
+        mask_out = F.grid_sample(
+            1.0 - nan_mask, grid, mode="nearest", padding_mode="zeros", align_corners=False
+        )
 
         pointmap_out = pointmap_out.squeeze(0)
         # mask_out contains 1 where valid, 0 where invalid (was NaN or padding)
         mask_out = mask_out.squeeze(0).squeeze(0) < 0.5  # True where should be NaN
 
-        # Apply rotation to XY coordinates of the world points
-        theta = math.radians(angle)
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
-
-        x = pointmap_out[0].clone()
-        y = pointmap_out[1].clone()
-        # Note: We apply inverse rotation to world coordinates since the spatial
-        # transform already moved pixels. This keeps world coords consistent.
-        # Actually, for pointmap, we want to preserve the original world coordinates
-        # at the new pixel locations - no need to rotate the values themselves.
-        # The spatial resampling already handles this.
+        # Note: For pointmap, we want to preserve the original world coordinates
+        # at the new pixel locations - no need to rotate the coordinate values.
+        # The spatial resampling already handles pixel repositioning.
+        _ = math.radians(angle)  # Keep for potential future use
 
         # Restore NaN for background pixels
-        pointmap_out = torch.where(mask_out.unsqueeze(0).expand_as(pointmap_out), 
-                                   torch.full_like(pointmap_out, float('nan')), 
-                                   pointmap_out)
+        pointmap_out = torch.where(
+            mask_out.unsqueeze(0).expand_as(pointmap_out),
+            torch.full_like(pointmap_out, float("nan")),
+            pointmap_out,
+        )
 
         return pointmap_out
 
@@ -260,11 +262,7 @@ class SliceAugmentor:
         return image
 
 
-def create_augmentor(
-    enable: bool = True,
-    mode: str = 'train',
-    **kwargs
-) -> SliceAugmentor:
+def create_augmentor(enable: bool = True, mode: str = "train", **kwargs) -> SliceAugmentor:
     """Factory function to create augmentor with preset configurations.
 
     Args:
@@ -275,7 +273,7 @@ def create_augmentor(
     Returns:
         SliceAugmentor instance
     """
-    if mode == 'train':
+    if mode == "train":
         config = SliceAugmentorConfig(
             enable=enable,
             p=0.5,
@@ -289,7 +287,7 @@ def create_augmentor(
             gamma_range=(0.9, 1.1),
             noise_std=0.02,
         )
-    elif mode == 'val':
+    elif mode == "val":
         # Light augmentations for validation (optional)
         config = SliceAugmentorConfig(
             enable=enable,

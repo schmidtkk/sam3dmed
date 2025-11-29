@@ -2,26 +2,29 @@
 Metrics utilities used for medical evaluation: Dice, Chamfer, HD95.
 This file uses optional external libs when available and provides NumPy/Scipy fallbacks.
 """
+
 from __future__ import annotations
-import warnings
+
 import numpy as np
-from typing import Tuple
 
 try:
     # optional: PyTorch3D chamfer distance
     from pytorch3d.loss import chamfer_distance as _chamfer_distance_p3d
+
     _HAS_PYTORCH3D = True
 except Exception:
     _HAS_PYTORCH3D = False
 
 try:
-    from surface_distance import compute_surface_distances, compute_robust_hausdorff
+    from surface_distance import compute_robust_hausdorff, compute_surface_distances
+
     _HAS_SURFACE_DISTANCE = True
 except Exception:
     _HAS_SURFACE_DISTANCE = False
 
 try:
     from scipy.spatial import cKDTree
+
     _HAS_SCIPY = True
 except Exception:
     _HAS_SCIPY = False
@@ -30,6 +33,7 @@ except Exception:
 def _to_numpy(x):
     """Convert tensor or array to numpy array."""
     import torch
+
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
     return np.asarray(x)
@@ -60,7 +64,7 @@ def _compute_chamfer_numpy(points_a: np.ndarray, points_b: np.ndarray) -> float:
     Returns per-point mean squared distances sum.
     """
     if points_a.shape[0] == 0 or points_b.shape[0] == 0:
-        return float('inf')
+        return float("inf")
     if not _HAS_SCIPY:
         raise RuntimeError("scipy must be installed to compute chamfer fallback")
     tree_a = cKDTree(points_a)
@@ -68,7 +72,7 @@ def _compute_chamfer_numpy(points_a: np.ndarray, points_b: np.ndarray) -> float:
     d_ab, _ = tree_b.query(points_a, k=1)
     d_ba, _ = tree_a.query(points_b, k=1)
     # Mean squared distances
-    return float(np.mean(d_ab ** 2) + np.mean(d_ba ** 2))
+    return float(np.mean(d_ab**2) + np.mean(d_ba**2))
 
 
 def compute_chamfer(points_a: np.ndarray, points_b: np.ndarray) -> float:
@@ -84,6 +88,7 @@ def compute_chamfer(points_a: np.ndarray, points_b: np.ndarray) -> float:
     points_b = np.asarray(points_b, dtype=np.float32)
     if _HAS_PYTORCH3D:
         import torch
+
         pta = torch.from_numpy(points_a[None]).to(torch.float32)
         ptb = torch.from_numpy(points_b[None]).to(torch.float32)
         with torch.no_grad():
@@ -93,7 +98,9 @@ def compute_chamfer(points_a: np.ndarray, points_b: np.ndarray) -> float:
         return _compute_chamfer_numpy(points_a, points_b)
 
 
-def compute_hd95(pred_mask: np.ndarray, gt_mask: np.ndarray, spacing: Tuple[float, ...] = (1.0, 1.0, 1.0)) -> float:
+def compute_hd95(
+    pred_mask: np.ndarray, gt_mask: np.ndarray, spacing: tuple[float, ...] = (1.0, 1.0, 1.0)
+) -> float:
     """Compute robust Hausdorff distance HD95 between binary masks.
 
     Args:
@@ -105,17 +112,19 @@ def compute_hd95(pred_mask: np.ndarray, gt_mask: np.ndarray, spacing: Tuple[floa
     """
     pred_mask = np.asarray(pred_mask).astype(np.bool_)
     gt_mask = np.asarray(gt_mask).astype(np.bool_)
-    
+
     # Squeeze singleton dimensions
     pred_mask = np.squeeze(pred_mask)
     gt_mask = np.squeeze(gt_mask)
-    
+
     # Adjust spacing to match mask dimensionality
     ndim = pred_mask.ndim
     if len(spacing) != ndim:
-        spacing = spacing[:ndim] if len(spacing) > ndim else spacing + (1.0,) * (ndim - len(spacing))
+        spacing = (
+            spacing[:ndim] if len(spacing) > ndim else spacing + (1.0,) * (ndim - len(spacing))
+        )
     spacing = np.array(spacing)
-    
+
     if _HAS_SURFACE_DISTANCE:
         distances = compute_surface_distances(gt_mask, pred_mask, spacing)
         return float(compute_robust_hausdorff(distances, 95))
@@ -123,13 +132,14 @@ def compute_hd95(pred_mask: np.ndarray, gt_mask: np.ndarray, spacing: Tuple[floa
     if not _HAS_SCIPY:
         raise RuntimeError("scipy (scipy.spatial) is required for fallback HD95 implementation")
     from scipy.ndimage import binary_erosion
+
     # compute surfaces using binary erosion
     gt_surface = gt_mask & (~binary_erosion(gt_mask))
     pred_surface = pred_mask & (~binary_erosion(pred_mask))
     gt_pts = np.argwhere(gt_surface) * spacing
     pred_pts = np.argwhere(pred_surface) * spacing
     if gt_pts.size == 0 or pred_pts.size == 0:
-        return float('inf')
+        return float("inf")
     tree_gt = cKDTree(gt_pts)
     tree_pred = cKDTree(pred_pts)
     d_pred_to_gt, _ = tree_gt.query(pred_pts, k=1)

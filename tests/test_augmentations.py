@@ -8,14 +8,15 @@ Validates that:
 4. Disabled augmentor returns inputs unchanged
 """
 
-import pytest
-import numpy as np
 import torch
 
 
 def test_augmentor_preserves_nan():
     """NaN background pixels in pointmap should be preserved after transforms."""
-    from sam3d_objects.data.dataset.ts.slice_augmentations import SliceAugmentor, SliceAugmentorConfig
+    from sam3d_objects.data.dataset.ts.slice_augmentations import (
+        SliceAugmentor,
+        SliceAugmentorConfig,
+    )
 
     H, W = 64, 64
     C = 3
@@ -27,7 +28,7 @@ def test_augmentor_preserves_nan():
 
     pointmap = torch.randn(3, H, W)
     # Set background to NaN
-    pointmap[:, mask == 0] = float('nan')
+    pointmap[:, mask == 0] = float("nan")
 
     # Ensure we have NaN values
     assert torch.isnan(pointmap).any(), "pointmap should have NaN values"
@@ -46,7 +47,7 @@ def test_augmentor_preserves_nan():
         result = augmentor(image.clone(), mask.clone(), pointmap.clone())
 
         # Check output has NaN values preserved
-        assert torch.isnan(result['pointmap']).any(), "NaN should be preserved in pointmap"
+        assert torch.isnan(result["pointmap"]).any(), "NaN should be preserved in pointmap"
 
         # Check that where mask is 0, pointmap should be NaN (after transform, some pixels may move)
         # This is a weaker check since transforms can shift pixels
@@ -54,7 +55,10 @@ def test_augmentor_preserves_nan():
 
 def test_augmentor_output_shapes():
     """Output shapes should match input shapes."""
-    from sam3d_objects.data.dataset.ts.slice_augmentations import SliceAugmentor, SliceAugmentorConfig
+    from sam3d_objects.data.dataset.ts.slice_augmentations import (
+        SliceAugmentor,
+        SliceAugmentorConfig,
+    )
 
     H, W = 64, 64
     C = 3
@@ -63,21 +67,30 @@ def test_augmentor_output_shapes():
     mask = torch.zeros(H, W)
     mask[20:50, 20:50] = 1.0
     pointmap = torch.randn(3, H, W)
-    pointmap[:, mask == 0] = float('nan')
+    pointmap[:, mask == 0] = float("nan")
 
     config = SliceAugmentorConfig(enable=True, p=1.0)
     augmentor = SliceAugmentor(config)
 
     result = augmentor(image, mask, pointmap)
 
-    assert result['image'].shape == image.shape, f"image shape mismatch: {result['image'].shape} vs {image.shape}"
-    assert result['mask'].shape == mask.shape, f"mask shape mismatch: {result['mask'].shape} vs {mask.shape}"
-    assert result['pointmap'].shape == pointmap.shape, f"pointmap shape mismatch: {result['pointmap'].shape} vs {pointmap.shape}"
+    assert result["image"].shape == image.shape, (
+        f"image shape mismatch: {result['image'].shape} vs {image.shape}"
+    )
+    assert result["mask"].shape == mask.shape, (
+        f"mask shape mismatch: {result['mask'].shape} vs {mask.shape}"
+    )
+    assert result["pointmap"].shape == pointmap.shape, (
+        f"pointmap shape mismatch: {result['pointmap'].shape} vs {pointmap.shape}"
+    )
 
 
 def test_augmentor_disabled():
     """Disabled augmentor should return inputs unchanged."""
-    from sam3d_objects.data.dataset.ts.slice_augmentations import SliceAugmentor, SliceAugmentorConfig
+    from sam3d_objects.data.dataset.ts.slice_augmentations import (
+        SliceAugmentor,
+        SliceAugmentorConfig,
+    )
 
     H, W = 64, 64
     C = 3
@@ -86,25 +99,29 @@ def test_augmentor_disabled():
     mask = torch.zeros(H, W)
     mask[20:50, 20:50] = 1.0
     pointmap = torch.randn(3, H, W)
-    pointmap[:, mask == 0] = float('nan')
+    pointmap[:, mask == 0] = float("nan")
 
     config = SliceAugmentorConfig(enable=False)
     augmentor = SliceAugmentor(config)
 
     result = augmentor(image.clone(), mask.clone(), pointmap.clone())
 
-    assert torch.allclose(result['image'], image), "disabled augmentor should not change image"
-    assert torch.allclose(result['mask'], mask), "disabled augmentor should not change mask"
+    assert torch.allclose(result["image"], image), "disabled augmentor should not change image"
+    assert torch.allclose(result["mask"], mask), "disabled augmentor should not change mask"
     # For pointmap with NaN, use manual comparison
-    assert result['pointmap'].shape == pointmap.shape
+    assert result["pointmap"].shape == pointmap.shape
     valid_mask = ~torch.isnan(pointmap)
-    assert torch.allclose(result['pointmap'][valid_mask], pointmap[valid_mask]), \
+    assert torch.allclose(result["pointmap"][valid_mask], pointmap[valid_mask]), (
         "disabled augmentor should not change valid pointmap values"
+    )
 
 
 def test_augmentor_p_zero():
     """Augmentor with p=0 should return inputs unchanged."""
-    from sam3d_objects.data.dataset.ts.slice_augmentations import SliceAugmentor, SliceAugmentorConfig
+    from sam3d_objects.data.dataset.ts.slice_augmentations import (
+        SliceAugmentor,
+        SliceAugmentorConfig,
+    )
 
     H, W = 32, 32
     C = 3
@@ -119,12 +136,15 @@ def test_augmentor_p_zero():
     # Run multiple times - should always return unchanged
     for _ in range(10):
         result = augmentor(image.clone(), mask.clone(), pointmap.clone())
-        assert torch.allclose(result['image'], image), "p=0 should not change image"
+        assert torch.allclose(result["image"], image), "p=0 should not change image"
 
 
 def test_augmentor_flip_horizontal():
     """Horizontal flip should reverse the last dimension."""
-    from sam3d_objects.data.dataset.ts.slice_augmentations import SliceAugmentor, SliceAugmentorConfig
+    from sam3d_objects.data.dataset.ts.slice_augmentations import (
+        SliceAugmentor,
+        SliceAugmentorConfig,
+    )
 
     H, W = 32, 32
     C = 3
@@ -135,7 +155,9 @@ def test_augmentor_flip_horizontal():
 
     mask = torch.ones(H, W)
     pointmap = torch.zeros(3, H, W)
-    pointmap[0, :, :] = torch.arange(W).float().unsqueeze(0).expand(H, -1)  # X increases left to right
+    pointmap[0, :, :] = (
+        torch.arange(W).float().unsqueeze(0).expand(H, -1)
+    )  # X increases left to right
 
     config = SliceAugmentorConfig(
         enable=True,
@@ -154,6 +176,7 @@ def test_augmentor_flip_horizontal():
 
     # Force flip by setting random seed
     import random
+
     random.seed(42)
 
     # With p=1.0 and only flip enabled, we should see flipped output 50% of time
@@ -161,14 +184,17 @@ def test_augmentor_flip_horizontal():
     # Actually, flip is random within the augmentor, so let's just verify shape for now
     result = augmentor(image.clone(), mask.clone(), pointmap.clone())
 
-    assert result['image'].shape == image.shape
-    assert result['mask'].shape == mask.shape
-    assert result['pointmap'].shape == pointmap.shape
+    assert result["image"].shape == image.shape
+    assert result["mask"].shape == mask.shape
+    assert result["pointmap"].shape == pointmap.shape
 
 
 def test_augmentor_rotation():
     """Rotation should not create NaN in valid regions (approximately)."""
-    from sam3d_objects.data.dataset.ts.slice_augmentations import SliceAugmentor, SliceAugmentorConfig
+    from sam3d_objects.data.dataset.ts.slice_augmentations import (
+        SliceAugmentor,
+        SliceAugmentorConfig,
+    )
 
     H, W = 64, 64
     C = 3
@@ -192,7 +218,7 @@ def test_augmentor_rotation():
 
     # Check that center region is still valid (not NaN) - rotation may create NaN at edges
     center_slice = slice(H // 4, 3 * H // 4), slice(W // 4, 3 * W // 4)
-    center_pointmap = result['pointmap'][:, center_slice[0], center_slice[1]]
+    center_pointmap = result["pointmap"][:, center_slice[0], center_slice[1]]
 
     # Most of center should be valid
     nan_ratio = torch.isnan(center_pointmap).float().mean()
@@ -203,17 +229,17 @@ def test_create_augmentor_modes():
     """Factory function should create augmentors with correct presets."""
     from sam3d_objects.data.dataset.ts.slice_augmentations import create_augmentor
 
-    train_aug = create_augmentor(enable=True, mode='train')
+    train_aug = create_augmentor(enable=True, mode="train")
     assert train_aug.config.enable is True
     assert train_aug.config.p == 0.5
     assert train_aug.config.rotation_range == 15.0
 
-    val_aug = create_augmentor(enable=True, mode='val')
+    val_aug = create_augmentor(enable=True, mode="val")
     assert val_aug.config.enable is True
     assert val_aug.config.p == 0.3
     assert val_aug.config.rotation_range == 5.0
 
-    test_aug = create_augmentor(enable=True, mode='test')
+    test_aug = create_augmentor(enable=True, mode="test")
     assert test_aug.config.enable is False
 
 
@@ -221,14 +247,17 @@ def test_create_augmentor_override():
     """Factory function should allow overriding config fields."""
     from sam3d_objects.data.dataset.ts.slice_augmentations import create_augmentor
 
-    aug = create_augmentor(enable=True, mode='train', rotation_range=45.0, p=0.9)
+    aug = create_augmentor(enable=True, mode="train", rotation_range=45.0, p=0.9)
     assert aug.config.rotation_range == 45.0
     assert aug.config.p == 0.9
 
 
 def test_intensity_augmentations():
     """Intensity augmentations should modify image values."""
-    from sam3d_objects.data.dataset.ts.slice_augmentations import SliceAugmentor, SliceAugmentorConfig
+    from sam3d_objects.data.dataset.ts.slice_augmentations import (
+        SliceAugmentor,
+        SliceAugmentorConfig,
+    )
 
     H, W = 32, 32
     C = 3
@@ -256,7 +285,7 @@ def test_intensity_augmentations():
     changes_detected = 0
     for _ in range(10):
         result = augmentor(image.clone(), mask.clone(), pointmap.clone())
-        if not torch.allclose(result['image'], image, atol=0.01):
+        if not torch.allclose(result["image"], image, atol=0.01):
             changes_detected += 1
 
     assert changes_detected > 0, "Intensity augmentations should modify image"
