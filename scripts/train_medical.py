@@ -697,3 +697,124 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def train_from_config(cfg: dict):
+    """Run training using a configuration dictionary (e.g., from Hydra or OmegaConf).
+
+    Expected config structured similarly to the CLI args used in `main()`.
+    """
+    class Args:
+        pass
+
+    args = Args()
+    # Load common training params
+    args.batch_size = int(cfg.get("training", {}).get("batch_size", 4))
+    args.epochs = int(cfg.get("training", {}).get("epochs", 50))
+    args.lr = float(cfg.get("training", {}).get("lr", 1e-3))
+    args.weight_decay = float(cfg.get("training", {}).get("weight_decay", 0.01))
+    args.grad_accum = int(cfg.get("training", {}).get("grad_accum", 1))
+    args.num_workers = int(cfg.get("training", {}).get("num_workers", 4))
+    args.no_mixed_precision = not cfg.get("training", {}).get("mixed_precision", True)
+
+    # LoRA
+    args.lora_rank = int(cfg.get("lora", {}).get("rank", 4))
+    args.lora_alpha = float(cfg.get("lora", {}).get("alpha", 8.0))
+
+    # Checkpointing
+    args.checkpoint_dir = cfg.get("checkpoint", {}).get("dir", "./checkpoints/medical")
+    args.resume = cfg.get("checkpoint", {}).get("resume", None)
+    args.save_every = int(cfg.get("checkpoint", {}).get("save_every", 5))
+
+    # Data
+    args.use_dataset = bool(cfg.get("data", {}).get("use_dataset", True))
+    args.data_root = cfg.get("data", {}).get("data_root")
+    args.slice_cache_dir = cfg.get("data", {}).get("slice_cache_dir")
+    args.augment = bool(cfg.get("data", {}).get("augment", False))
+
+    # Device
+    args.device = cfg.get("device", "cuda")
+
+    # Build train_loader based on dataset flag
+    if args.use_dataset:
+        logger.info("(Hydra) Creating TS_SAM3D_Dataset loader from data_root: %s", args.data_root)
+        if args.data_root is None:
+            raise ValueError("data.data_root is required when use_dataset is true")
+        from sam3d_objects.data.dataset.ts.ts_sam3d_dataloader import (
+            TS_SAM3D_Dataset,
+            data_collate,
+        )
+        slice_cache_dir = args.slice_cache_dir or (str(args.data_root) + "/slice_cache")
+        train_ds = TS_SAM3D_Dataset(
+            original_nifti_dir=args.data_root,
+            cache_slices=True,
+            slice_cache_dir=slice_cache_dir,
+            classes=1,
+            augment=args.augment,
+            augment_mode="train",
+            occupancy_threshold=0.01,
+        )
+        from torch.utils.data import DataLoader
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=data_collate,
+            num_workers=args.num_workers,
+        )
+    else:
+        logger.info("(Hydra) Creating dummy data loaders for quick test runs")
+        from torch.utils.data import TensorDataset
+
+        dummy_images = torch.randn(100, 1, 256, 256)
+        dummy_pointmaps = torch.randn(100, 256, 256, 3)
+        dummy_sdfs = torch.randn(100, 1, 64, 64, 64)
+        dummy_masks = (torch.rand(100, 64, 64, 64) > 0.5).float()
+
+        train_dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
+
+        def collate_fn(batch):
+            images, pointmaps, sdfs, masks = zip(*batch)
+            return {
+                "image": torch.stack(images),
+                "pointmap": torch.stack(pointmaps),
+                "sdf": torch.stack(sdfs),
+                "mask": torch.stack(masks),
+            }
+
+        from torch.utils.data import DataLoader
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=0,
+        )
+
+    # Create model & trainer and re-use logic
+    model = create_dummy_model()
+    trainer = MedicalTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=None,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        checkpoint_dir=args.checkpoint_dir,
+        grad_accum_steps=args.grad_accum,
+        mixed_precision=not args.no_mixed_precision,
+        device=args.device,
+        loss_config={
+            "sdf_weight": 1.0,
+            "chamfer_weight": 0.5,
+            "mesh_reg_weight": 0.1,
+        },
+    )
+
+    if args.resume:
+        trainer.load_checkpoint(args.resume)
+
+    trainer.train(epochs=args.epochs, save_every=args.save_every, validate_every=1)

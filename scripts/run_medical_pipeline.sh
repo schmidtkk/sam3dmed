@@ -125,31 +125,22 @@ if [[ $ONLY_EVAL -eq 0 ]]; then
   # simple and avoids inline Python.
   TRAIN_CMD=(
     python3
-    scripts/train_medical.py
-    --use_dataset
-    --data_root
-    "$OUT_DIR"
-    --batch_size
-    "$BATCH_SIZE"
-    --epochs
-    "$EPOCHS"
-    --lr
-    "$LR"
-    --device
-    "$DEVICE"
-    --checkpoint_dir
-    "$CHECKPOINT_DIR"
-    --lora_rank
-    "$LORA_RANK"
-    --lora_alpha
-    "$LORA_ALPHA"
-    --num_workers
-    "$NUM_WORKERS"
-    --augment
+    scripts/train_medical_hydra.py
+    "data.use_dataset=true"
+    "data.data_root=$OUT_DIR"
+    "training.batch_size=$BATCH_SIZE"
+    "training.epochs=$EPOCHS"
+    "training.lr=$LR"
+    "device=$DEVICE"
+    "checkpoint.dir=$CHECKPOINT_DIR"
+    "lora.rank=$LORA_RANK"
+    "lora.alpha=$LORA_ALPHA"
+    "training.num_workers=$NUM_WORKERS"
+    "data.augment=true"
   )
 
   if [[ -n "$RESUME" ]]; then
-    TRAIN_CMD+=(--resume "$RESUME")
+    TRAIN_CMD+=("checkpoint.resume=$RESUME")
   fi
 
   "${TRAIN_CMD[@]}" || { echo "Training failed"; exit 1; }

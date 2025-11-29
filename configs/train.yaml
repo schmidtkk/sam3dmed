@@ -1,0 +1,37 @@
+# Hydra config for training
+
+# Data
+data:
+  use_dataset: true
+  data_root: /path/to/preprocessed
+  slice_cache_dir: null
+  augment: false
+  classes: 1
+
+# Training param
+training:
+  batch_size: 4
+  epochs: 50
+  lr: 0.001
+  weight_decay: 0.01
+  grad_accum: 1
+  num_workers: 4
+  mixed_precision: true
+
+# LoRA
+lora:
+  rank: 4
+  alpha: 8.0
+
+# Device
+device: cuda
+
+# Checkpoint
+checkpoint:
+  dir: ./checkpoints/medical
+  resume: null
+  save_every: 1
+
+# Model
+model:
+  name: dummy
