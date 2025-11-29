@@ -43,7 +43,9 @@ STATUS NOTE — Read before starting implementation
 
 ### Not Started
 - [ ] Phase 5: TS_SAM3D_Dataset loader finalization
-- [ ] Phase 6: LoRA adapters
+- [x] Phase 6: LoRA adapters
+  - `sam3d_objects/model/lora.py`: LoRALinear class, inject_lora, freeze_base_params, merge utilities
+  - Tests: `tests/test_lora.py` (18 tests pass)
 - [ ] Phase 7: Training harness
 - [ ] Phase 8: Evaluation pipeline
 - [ ] Phase 9: CI tests
