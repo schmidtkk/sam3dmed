@@ -27,17 +27,27 @@ except Exception:
     _HAS_SCIPY = False
 
 
-def compute_dice(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-8) -> float:
+def _to_numpy(x):
+    """Convert tensor or array to numpy array."""
+    import torch
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def compute_dice(pred, gt, eps: float = 1e-8) -> float:
     """Compute voxel-level Dice score for binary volumes.
 
     Args:
-        pred: binary ndarray (Bools or ints 0/1) or float mask
-        gt: binary ndarray
+        pred: binary ndarray or tensor (Bools or ints 0/1) or float mask
+        gt: binary ndarray or tensor
     Returns:
         Dice score float in [0,1]
     """
-    pred_b = (pred > 0).astype(np.float32)
-    gt_b = (gt > 0).astype(np.float32)
+    pred_np = _to_numpy(pred)
+    gt_np = _to_numpy(gt)
+    pred_b = (pred_np > 0).astype(np.float32)
+    gt_b = (gt_np > 0).astype(np.float32)
     intersection = np.sum(pred_b * gt_b)
     denom = np.sum(pred_b) + np.sum(gt_b)
     if denom == 0:
@@ -83,18 +93,29 @@ def compute_chamfer(points_a: np.ndarray, points_b: np.ndarray) -> float:
         return _compute_chamfer_numpy(points_a, points_b)
 
 
-def compute_hd95(pred_mask: np.ndarray, gt_mask: np.ndarray, spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)) -> float:
+def compute_hd95(pred_mask: np.ndarray, gt_mask: np.ndarray, spacing: Tuple[float, ...] = (1.0, 1.0, 1.0)) -> float:
     """Compute robust Hausdorff distance HD95 between binary masks.
 
     Args:
-        pred_mask: binary ndarray
-        gt_mask: binary ndarray
-        spacing: voxel spacing (mm) along (z,y,x)
+        pred_mask: binary ndarray (2D or 3D)
+        gt_mask: binary ndarray (2D or 3D)
+        spacing: voxel spacing (mm) - tuple matching dimensionality of masks
     Returns:
         HD95 metric float (95th percentile)
     """
     pred_mask = np.asarray(pred_mask).astype(np.bool_)
     gt_mask = np.asarray(gt_mask).astype(np.bool_)
+    
+    # Squeeze singleton dimensions
+    pred_mask = np.squeeze(pred_mask)
+    gt_mask = np.squeeze(gt_mask)
+    
+    # Adjust spacing to match mask dimensionality
+    ndim = pred_mask.ndim
+    if len(spacing) != ndim:
+        spacing = spacing[:ndim] if len(spacing) > ndim else spacing + (1.0,) * (ndim - len(spacing))
+    spacing = np.array(spacing)
+    
     if _HAS_SURFACE_DISTANCE:
         distances = compute_surface_distances(gt_mask, pred_mask, spacing)
         return float(compute_robust_hausdorff(distances, 95))
@@ -105,8 +126,8 @@ def compute_hd95(pred_mask: np.ndarray, gt_mask: np.ndarray, spacing: Tuple[floa
     # compute surfaces using binary erosion
     gt_surface = gt_mask & (~binary_erosion(gt_mask))
     pred_surface = pred_mask & (~binary_erosion(pred_mask))
-    gt_pts = np.argwhere(gt_surface) * np.array(spacing)
-    pred_pts = np.argwhere(pred_surface) * np.array(spacing)
+    gt_pts = np.argwhere(gt_surface) * spacing
+    pred_pts = np.argwhere(pred_surface) * spacing
     if gt_pts.size == 0 or pred_pts.size == 0:
         return float('inf')
     tree_gt = cKDTree(gt_pts)

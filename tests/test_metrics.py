@@ -5,7 +5,8 @@ from sam3d_objects.utils.metrics import compute_dice, compute_chamfer, compute_h
 def test_dice_identical():
     a = np.zeros((4, 4, 4), dtype=np.uint8)
     a[1:3, 1:3, 1:3] = 1
-    assert compute_dice(a, a) == 1.0
+    # Use approximate comparison due to epsilon in Dice formula
+    assert abs(compute_dice(a, a) - 1.0) < 1e-6
 
 
 def test_dice_disjoint():
