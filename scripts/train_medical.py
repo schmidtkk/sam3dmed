@@ -589,6 +589,11 @@ def parse_args():
 
     # Hardware
     parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--use_dataset", action="store_true", help="Use TS_SAM3D_Dataset instead of dummy data")
+    parser.add_argument("--data_root", type=str, default=None, help="Path to preprocessed data (slice cache) - used when --use_dataset is set")
+    parser.add_argument("--slice_cache_dir", type=str, default=None, help="Slice cache dir override (defaults to data_root/slice_cache)")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--augment", action="store_true", default=False, help="Enable per-slice augmentations when using dataset")
     parser.add_argument("--no_mixed_precision", action="store_true", help="Disable mixed precision")
 
     return parser.parse_args()
@@ -601,34 +606,59 @@ def main():
     logger.info("Medical Fine-Tuning Script")
     logger.info(f"Args: {args}")
 
-    # Create dummy data for now
-    # TODO: Replace with actual data loading
-    logger.info("Creating dummy data loaders...")
-    from torch.utils.data import TensorDataset
+    # Create data loader
+    if args.use_dataset:
+        logger.info("Creating TS_SAM3D_Dataset loader from data_root: %s", args.data_root)
+        if args.data_root is None:
+            raise ValueError("--data_root is required when --use_dataset is set")
+        from sam3d_objects.data.dataset.ts.ts_sam3d_dataloader import (
+            TS_SAM3D_Dataset,
+            data_collate,
+        )
+        slice_cache_dir = args.slice_cache_dir or (str(args.data_root) + "/slice_cache")
+        train_ds = TS_SAM3D_Dataset(
+            original_nifti_dir=args.data_root,
+            cache_slices=True,
+            slice_cache_dir=slice_cache_dir,
+            classes=1,
+            augment=args.augment,
+            augment_mode="train",
+            occupancy_threshold=0.01,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=data_collate,
+            num_workers=args.num_workers,
+        )
+    else:
+        logger.info("Creating dummy data loaders for quick test runs")
+        from torch.utils.data import TensorDataset
 
-    dummy_images = torch.randn(100, 1, 256, 256)
-    dummy_pointmaps = torch.randn(100, 256, 256, 3)
-    dummy_sdfs = torch.randn(100, 1, 64, 64, 64)
-    dummy_masks = (torch.rand(100, 64, 64, 64) > 0.5).float()
+        dummy_images = torch.randn(100, 1, 256, 256)
+        dummy_pointmaps = torch.randn(100, 256, 256, 3)
+        dummy_sdfs = torch.randn(100, 1, 64, 64, 64)
+        dummy_masks = (torch.rand(100, 64, 64, 64) > 0.5).float()
 
-    train_dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
+        train_dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
 
-    def collate_fn(batch):
-        images, pointmaps, sdfs, masks = zip(*batch)
-        return {
-            "image": torch.stack(images),
-            "pointmap": torch.stack(pointmaps),
-            "sdf": torch.stack(sdfs),
-            "mask": torch.stack(masks),
-        }
+        def collate_fn(batch):
+            images, pointmaps, sdfs, masks = zip(*batch)
+            return {
+                "image": torch.stack(images),
+                "pointmap": torch.stack(pointmaps),
+                "sdf": torch.stack(sdfs),
+                "mask": torch.stack(masks),
+            }
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0,
-    )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=0,
+        )
 
     # Create model
     logger.info("Creating dummy model...")
