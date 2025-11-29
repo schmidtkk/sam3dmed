@@ -15,22 +15,25 @@ python scripts/reprocess_ts_nifti.py \
   --save_metadata
 ```
 
-## 2) Train with the dataset (no inline Python; direct CLI)
+## 2) Train with the dataset using Hydra (preferred)
 
 ```bash
-python scripts/train_medical.py \
-  --use_dataset \
-  --data_root /path/to/preprocessed \
-  --batch_size 4 \
-  --epochs 50 \
-  --lr 1e-3 \
-  --device cuda \
-  --checkpoint_dir ./checkpoints/medical \
-  --lora_rank 4 \
-  --lora_alpha 8.0 \
-  --num_workers 4 \
-  --augment
+# Using the hydra YAML configuration (recommended):
+python scripts/train_medical_hydra.py \
+  data.use_dataset=true \
+  data.data_root=/path/to/preprocessed \
+  training.batch_size=4 \
+  training.epochs=50 \
+  training.lr=1e-3 \
+  device=cuda \
+  checkpoint.dir=./checkpoints/medical \
+  lora.rank=4 \
+  lora.alpha=8.0 \
+  training.num_workers=4 \
+  data.augment=true
 ```
+
+You can still call the original `train_medical.py` for compatibility, but we recommend migrating to the Hydra YAML-based runner.
 
 If you prefer to run the full pipeline (preprocess -> train -> eval) in one step, use the helper script:
 

@@ -49,10 +49,15 @@ class LoRALinear(nn.Module):
 
         in_features = original_linear.in_features
         out_features = original_linear.out_features
+        device = original_linear.weight.device if hasattr(original_linear, 'weight') else None
 
-        # LoRA matrices
-        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        # LoRA matrices - place on original linear device (handles CPU/GPU injection order)
+        if device is not None:
+            self.lora_A = nn.Parameter(torch.zeros(rank, in_features, device=device))
+            self.lora_B = nn.Parameter(torch.zeros(out_features, rank, device=device))
+        else:
+            self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
+            self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
 
         # Dropout for LoRA path
         self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
