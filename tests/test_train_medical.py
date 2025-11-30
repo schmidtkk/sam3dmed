@@ -15,6 +15,7 @@ from scripts.train_medical import (
     MedicalTrainer,
     MedicalTrainingLosses,
     create_dummy_model,
+    create_model,
 )
 
 
@@ -160,6 +161,81 @@ class TestCreateDummyModel:
 
         assert isinstance(outputs, dict)
         assert "sdf" in outputs
+
+
+def test_create_slat_mesh_model():
+    """Test that the SLatMeshDecoder can be instantiated via create_model factory."""
+    model = create_model(name="slat_mesh", params={
+        "resolution": 4,
+        "model_channels": 32,
+        "latent_channels": 16,
+        "num_blocks": 2,
+        "num_heads": 4,
+    })
+
+    assert isinstance(model, nn.Module)
+    # LoRA expects to find to_qkv/to_out attributes
+    assert hasattr(model, "to_qkv") or any(
+        hasattr(child, "to_qkv") for child in model.children()
+    )
+    assert hasattr(model, "to_out") or any(
+        hasattr(child, "to_out") for child in model.children()
+    )
+
+
+def test_slat_mesh_trainer_init(tmp_path):
+    """Test initializing MedicalTrainer with SLatMeshDecoder and ensure LoRA setup runs."""
+    from torch.utils.data import DataLoader, TensorDataset
+
+    model = create_model(name="slat_mesh", params={
+        "resolution": 4,
+        "model_channels": 32,
+        "latent_channels": 16,
+        "num_blocks": 2,
+        "num_heads": 4,
+        "device": "cpu",
+    })
+
+    # Create dummy dataset; no need to match forward exactly for init tests
+    dummy_images = torch.randn(8, 1, 64, 64)
+    dummy_pointmaps = torch.randn(8, 64, 64, 3)
+    dummy_sdfs = torch.randn(8, 1, 16, 16, 16)
+    dummy_masks = (torch.rand(8, 16, 16, 16) > 0.5).float()
+
+    dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
+
+    def collate_fn(batch):
+        images, pointmaps, sdfs, masks = zip(*batch)
+        return {
+            "image": torch.stack(images),
+            "pointmap": torch.stack(pointmaps),
+            "sdf": torch.stack(sdfs),
+            "mask": torch.stack(masks),
+        }
+
+    loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
+
+    trainer = MedicalTrainer(
+        model=model,
+        train_loader=loader,
+        val_loader=loader,
+        lr=1e-3,
+        checkpoint_dir=str(tmp_path),
+        mixed_precision=False,
+        device="cpu",
+    )
+
+    # After initialization, LoRA should have been injected
+    from sam3d_objects.model.lora import LoRALinear
+
+    # Walk named params to find lora modules
+    found = False
+    for _, module in trainer.model.named_modules():
+        if isinstance(module, LoRALinear):
+            found = True
+            break
+
+    assert found, "LoRA injection did not find any LoRALinear modules"
 
 
 class TestMedicalTrainer:

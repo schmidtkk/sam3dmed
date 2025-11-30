@@ -253,13 +253,18 @@ def main():
 
     axes = tuple(int(x) for x in args.axes.split(","))
 
-    # Find pairs of img/mask
+    # Find pairs of img/mask - handle multiple naming conventions
+    # Pattern 1: *_img.nii.gz / *_seg.nii.gz
+    # Pattern 2: *-image.nii.gz / *-label.nii.gz (TS dataset style)
     imgs = list(src_dir.glob("**/*img*.nii*"))
+    if len(imgs) == 0:
+        # Try TS dataset pattern
+        imgs = list(src_dir.glob("**/*-image.nii*"))
     if len(imgs) == 0:
         imgs = [
             p
             for p in src_dir.glob("**/*.nii*")
-            if not p.name.lower().endswith(("_seg.nii.gz", "_mask.nii.gz"))
+            if not p.name.lower().endswith(("_seg.nii.gz", "_mask.nii.gz", "-label.nii.gz"))
         ]
 
     metadata = {
@@ -271,18 +276,22 @@ def main():
     }
 
     for img_path in imgs:
-        # try to find mask
-        mask_candidates = list(img_path.parent.glob(img_path.stem + "*seg*.nii*")) + list(
-            img_path.parent.glob(img_path.stem + "*mask*.nii*")
-        )
+        # try to find mask - handle multiple naming conventions
+        base_name = img_path.stem.replace("-image", "").replace("_img", "")
+        mask_candidates = list(img_path.parent.glob(base_name + "*seg*.nii*")) + \
+                          list(img_path.parent.glob(base_name + "*mask*.nii*")) + \
+                          list(img_path.parent.glob(base_name + "*-label*.nii*")) + \
+                          list(img_path.parent.glob(base_name + "*_label*.nii*"))
         if len(mask_candidates) == 0:
-            mask_candidates = list(img_path.parent.glob("*seg*.nii*"))
+            mask_candidates = list(img_path.parent.glob("*seg*.nii*")) + \
+                              list(img_path.parent.glob("*-label*.nii*"))
         if len(mask_candidates) == 0:
             print(f"No mask found for {img_path}, skipping")
             continue
 
         mask_path = mask_candidates[0]
-        case_id = img_path.stem
+        # Extract case_id from image path - handle both patterns
+        case_id = img_path.stem.replace("-image", "").replace("_img", "")
         print(f"Processing case {case_id} ...")
 
         # Detect modality and get spacing

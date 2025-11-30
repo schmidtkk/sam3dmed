@@ -21,12 +21,17 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
 from loguru import logger
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Allow dev/test environment to skip heavy package initialization which may not exist in
+# trimmed test contexts by setting `LIDRA_SKIP_INIT` to avoid importing `sam3d_objects.init`.
+os.environ.setdefault('LIDRA_SKIP_INIT', '1')
 
 
 class MedicalEvaluator:
@@ -73,6 +78,9 @@ class MedicalEvaluator:
     def evaluate(
         self,
         save_predictions: bool = False,
+        visualize: bool = False,
+        visualize_every: int = 1,
+        visualize_format: str = "html",
         compute_per_class: bool = True,
     ) -> dict[str, float]:
         """
@@ -100,6 +108,9 @@ class MedicalEvaluator:
             # Save predictions if requested
             if save_predictions:
                 self._save_predictions(batch_idx, outputs, batch)
+
+            if visualize and (batch_idx % visualize_every == 0):
+                self._visualize_predictions(batch_idx, outputs, batch, format=visualize_format)
 
             # Log progress
             if (batch_idx + 1) % 10 == 0:
@@ -253,6 +264,113 @@ class MedicalEvaluator:
                 np.save(
                     pred_dir / f"batch_{batch_idx}_pred_vertices.npy", pred_vertices.cpu().numpy()
                 )
+
+        # Also save input image for reference
+        image = batch.get("image")
+        if image is not None:
+            # Convert to numpy and save as PNG (first sample in batch)
+            i = image[0].cpu()
+            # Convert channel-first to HWC if needed
+            if i.ndim == 3 and i.shape[0] in [1, 3]:
+                if i.shape[0] == 1:
+                    arr = i.squeeze(0).numpy()
+                    plt.imsave(pred_dir / f"batch_{batch_idx}_image.png", arr, cmap="gray")
+                else:
+                    arr = i.permute(1, 2, 0).numpy()
+                    plt.imsave(pred_dir / f"batch_{batch_idx}_image.png", arr)
+            else:
+                # Fallback: save raw numpy
+                np.save(pred_dir / f"batch_{batch_idx}_image.npy", i.numpy())
+
+        # Save mask if present
+        mask = batch.get("mask")
+        if mask is not None:
+            np.save(pred_dir / f"batch_{batch_idx}_mask.npy", mask.cpu().numpy())
+
+        # Save pointmap if present
+        pointmap = batch.get("pointmap")
+        if pointmap is not None:
+            np.save(pred_dir / f"batch_{batch_idx}_pointmap.npy", pointmap.cpu().numpy())
+
+    def _visualize_predictions(self, batch_idx: int, outputs: dict, batch: dict, format: str = "html") -> None:
+        """Create visual representations of predictions for the batch.
+
+        Supports `html` and `png` outputs for the 3D scene via Plotly. Saves 2D overlays as PNG.
+        """
+        viz_dir = self.output_dir / "visualizations"
+        viz_dir.mkdir(exist_ok=True)
+
+        have_scene_visualizer = True
+        try:
+            from sam3d_objects.utils.visualization import SceneVisualizer
+        except Exception:
+            have_scene_visualizer = False
+            logger.warning("SceneVisualizer not available; any 3D visualizations will be skipped")
+        viz_dir.mkdir(exist_ok=True)
+
+        # Extract image, pointmap, preds
+        images = batch.get("image")
+        pointmaps = batch.get("pointmap")
+        pred_sdf = outputs.get("sdf")
+        pred_vertices = outputs.get("vertices")
+
+        batch_size = 1 if images is None else images.shape[0]
+
+        for i in range(batch_size):
+            sample_dir = viz_dir / f"batch_{batch_idx}_sample_{i}"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+
+            # 2D overlay
+            if images is not None and pred_sdf is not None:
+                img = images[i].cpu()
+                sdf = pred_sdf[i].cpu()
+                # Convert image to HWC numpy
+                if img.ndim == 3 and img.shape[0] in [1, 3]:
+                    if img.shape[0] == 1:
+                        npimg = img.squeeze(0).numpy()
+                        cmap = "gray"
+                        plt.imsave(sample_dir / "overlay.png", npimg, cmap=cmap)
+                    else:
+                        npimg = img.permute(1, 2, 0).numpy()
+                        plt.imsave(sample_dir / "overlay.png", npimg)
+
+                # Save thresholded mask overlay
+                mask = (sdf <= 0).cpu().numpy()
+                np.save(sample_dir / "pred_mask.npy", mask)
+
+            # 3D pointmap/mesh visualization
+            # If vertices are available, render mesh using SceneVisualizer
+            if pred_vertices is not None and have_scene_visualizer:
+                # Plot mesh for this sample if it's a list or tensor
+                try:
+                    if isinstance(pred_vertices, list):
+                        pred_v = pred_vertices[i] if i < len(pred_vertices) else None
+                    else:
+                        pred_v = pred_vertices[i] if pred_vertices.dim() > 2 else pred_vertices
+                    # We need faces as well; the model may return mesh objects; attempt to find faces
+                    pred_faces = outputs.get("faces")
+                    if pred_v is not None and pred_faces is not None:
+                        # Create vertex colors placeholder
+                        colors = torch.ones_like(pred_v)
+                        fig = SceneVisualizer.plot_scene(
+                            points_local=pred_v,
+                            instance_quaternions_l2c=torch.tensor([1, 0, 0, 0]),
+                            instance_positions_l2c=torch.tensor([[0, 0, 0]]),
+                            instance_scales_l2c=torch.tensor([[1, 1, 1]]),
+                            pointmap=None,
+                            image=None,
+                        )
+                        html_path = sample_dir / "mesh.html"
+                        fig.write_html(str(html_path))
+                        if format == "png":
+                            try:
+                                png = fig.to_image(engine="kaleido")
+                                with open(sample_dir / "mesh.png", "wb") as f:
+                                    f.write(png)
+                            except Exception:
+                                logger.warning("Failed to render mesh as PNG (kaleido not installed) - HTML saved instead")
+                except Exception as ex:  # pragma: no cover - visualization is optional
+                    logger.exception(f"Visualization error: {ex}")
 
     def _save_results(self, aggregated: dict[str, float]) -> None:
         """Save evaluation results to JSON."""
@@ -461,6 +579,17 @@ def parse_args():
     # Output
     parser.add_argument("--output_dir", type=str, default="./results", help="Output directory")
     parser.add_argument("--save_predictions", action="store_true", help="Save predictions")
+    parser.add_argument("--model_hf", type=str, default=None, help="Hugging Face path to model (e.g., facebook/sam-3d-objects/slat_mesh) to load original model weights and config")
+    parser.add_argument("--no_lora", action="store_true", help="Do not inject LoRA adapters (original model only)")
+    parser.add_argument("--visualize", action="store_true", help="Create visualizations (HTML/PNG) for predictions")
+    parser.add_argument("--visualize_every", type=int, default=1, help="Visualize every N batches")
+    parser.add_argument(
+        "--visualize_format",
+        type=str,
+        default="html",
+        choices=["html", "png", "both"],
+        help="Format to save visualization (html|png|both)",
+    )
 
     # Metrics
     parser.add_argument(
@@ -509,20 +638,123 @@ def main():
     )
 
     # Create model
-    logger.info("Creating dummy model...")
-    model = create_dummy_model()
+    if args.model_hf is not None:
+        logger.info("Loading model from Hugging Face: %s", args.model_hf)
+        from sam3d_objects.model.backbone.tdfy_dit.models import from_pretrained
 
-    # Load checkpoint (if it exists)
+        try:
+            model = from_pretrained(args.model_hf)
+            logger.info("Loaded HF model: %s", args.model_hf)
+        except Exception as e:  # pragma: no cover - HF download may fail in some environment
+            logger.exception(f"Failed to load model from HF: {e}")
+            logger.info("Falling back to dummy model for evaluation")
+            model = create_dummy_model()
+    else:
+        logger.info("Creating dummy model...")
+        model = create_dummy_model()
+
+    # ----------- Safe checkpoint loading -----------
+    def safe_load_checkpoint(path: str):
+        """Safely load a checkpoint file.
+
+        - Ensures file exists and is not empty before attempting to load.
+        - Supports .safetensors via safetensors.torch.load_file.
+        - Attempts to use torch.load(weights_only=True) when available to mitigate pickle-based code execution risks; falls back when not supported.
+        """
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint file not found: {path}")
+
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+
+        if size == 0:
+            raise ValueError(f"Checkpoint file {path} is empty (0 bytes) — it may be corrupt or a placeholder.")
+
+        # Use safetensors loader when available and file extension matches
+        if path.endswith(".safetensors"):
+            try:
+                from safetensors.torch import load_file
+
+                return load_file(path)
+            except Exception as e:  # pragma: no cover - optional external dependency
+                logger.warning(f"Failed to load checkpoint with safetensors loader: {e}; falling back to torch.load")
+
+        # Try to use torch.load with weights_only=True if supported
+        try:
+            # Newer torch versions support weights_only to avoid executing pickled code
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            # weights_only not supported in this torch version
+            return torch.load(path, map_location="cpu")
+        except Exception as e:
+            # Reraise for higher-level handling
+            raise
+
+    # Load checkpoint (if it exists). If `--no_lora` is provided, do not inject LoRA.
     if os.path.exists(args.checkpoint):
         logger.info(f"Loading checkpoint from {args.checkpoint}")
-        from sam3d_objects.model.lora import inject_lora, load_lora_state_dict
+        try:
+            checkpoint = safe_load_checkpoint(args.checkpoint)
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        except ValueError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        except Exception as e:
+            logger.exception(f"Failed to load checkpoint: {e}")
+            sys.exit(1)
 
-        inject_lora(model, target_modules=["to_qkv", "to_out"], rank=4)
-        checkpoint = torch.load(args.checkpoint, map_location="cpu")
-        if "lora_state_dict" in checkpoint:
-            load_lora_state_dict(model, checkpoint["lora_state_dict"])
+        # Normalize checkpoint types: if torch.load returned a bare state dict mapping param->tensor,
+        # wrap as {'state_dict': <mapping>} to keep downstream logic consistent.
+        from collections.abc import Mapping
+
+        if isinstance(checkpoint, Mapping):
+            # If checkpoint looks like a state_dict (param->tensor mapping), wrap it
+            if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+                checkpoint = {"state_dict": checkpoint}
+        # If it's still a list/tuple or other, we don't transform it and handle errors downstream.
+
+        if not args.no_lora:
+            from sam3d_objects.model.lora import inject_lora, load_lora_state_dict
+
+            inject_lora(model, target_modules=["to_qkv", "to_out"], rank=4)
+            if isinstance(checkpoint, Mapping) and "lora_state_dict" in checkpoint:
+                load_lora_state_dict(model, checkpoint["lora_state_dict"])
+            elif isinstance(checkpoint, Mapping) and ("state_dict" in checkpoint or "model_state_dict" in checkpoint):
+                # If the checkpoint contains a full state_dict, load it as the fallback
+                key_name = "state_dict" if "state_dict" in checkpoint else "model_state_dict"
+                try:
+                    model.load_state_dict(checkpoint[key_name], strict=False)
+                except Exception:
+                    logger.warning("Failed to load full state_dict into model; continuing with LoRA injection only")
+        else:
+            logger.info("`--no_lora` set: not applying LoRA adapters (original model)")
+            # If it's a full model checkpoint, try loading full state dict.
+            try:
+                if isinstance(checkpoint, Mapping) and ("state_dict" in checkpoint or "model_state_dict" in checkpoint):
+                    key_name = "state_dict" if "state_dict" in checkpoint else "model_state_dict"
+                    model.load_state_dict(checkpoint[key_name], strict=False)
+                elif isinstance(checkpoint, Mapping) and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+                    model.load_state_dict(checkpoint, strict=False)
+                else:
+                    # Try loading as safetensors / direct state dict if file extension suggests
+                    if args.checkpoint.endswith(".safetensors"):
+                        try:
+                            from safetensors.torch import load_file
+
+                            sd = load_file(args.checkpoint)
+                            model.load_state_dict(sd, strict=False)
+                        except Exception as e:  # pragma: no cover - optional
+                            logger.warning(f"Failed to load safetensors checkpoint: {e}")
+            except Exception as e:  # pragma: no cover - best-effort fallback
+                logger.warning(f"Failed to load full checkpoint into model: {e}")
     else:
-        logger.warning(f"Checkpoint not found: {args.checkpoint}")
+        logger.error(f"Checkpoint not found: {args.checkpoint}")
+        sys.exit(1)
 
     # Create evaluator
     evaluator = MedicalEvaluator(
@@ -534,8 +766,13 @@ def main():
         occupancy_threshold=args.threshold,
     )
 
-    # Run evaluation
-    results = evaluator.evaluate(save_predictions=args.save_predictions)
+    # Run evaluation + optionally create visualizations in a single pass
+    results = evaluator.evaluate(
+        save_predictions=args.save_predictions,
+        visualize=args.visualize,
+        visualize_every=args.visualize_every,
+        visualize_format=args.visualize_format,
+    )
 
     # Create report
     create_evaluation_report(

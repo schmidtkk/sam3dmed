@@ -24,16 +24,16 @@ Note: The repo uses `PreProcessor` (see `sam3d_objects/data/dataset/tdfy/preproc
 
 ---
 
-## 1) Verify your raw NIfTI data and nnUNet preprocessed folder
+## 1) Verify your raw NIfTI data and preprocessed folder
 
-1. Check the directory structure used by the repo (the dataset in your workspace seems to be under `nnUNet_preprocessed/Dataset001_TS_Heart`):
-   - `case_XXXX.pkl` metadata and `case_XXXX.b2nd` blobs hold preprocessed arrays.
-  - If you have original NIfTI files (.nii / .nii.gz), you will need them if you require the true `affine` transforms, voxel spacing, or world coordinates — nnUNet preprocessed data may have removed these metadata or resampled them. `TS_nnUNet_Dataset` (see `sam3d_objects/data/dataset/ts/ts_nnunet_dataloader.py`) sets `affine = torch.eye(4)` as an identity placeholder — that will not provide metric coordinates.
-  - Important: the existing nnUNet preprocessed files in `nnUNet_preprocessed/Dataset001_TS_Heart` are not respaced and can introduce spatial mismatch for SAM3D reconstruction. Reprocess the raw NIfTI files located at `/mnt/nas1/disk01/weidongguo/dataset/TS` and replace the nnUNet preprocessed dataset for your experiments. This ensures correct `affine`, spacing and orientation for pointmap computation.
+1. Check the directory structure used by the repo (the dataset should be under `dataset/ts_processed` after preprocessing):
+   - `*.npz` files hold preprocessed slices with image, mask, and pointmap data.
+   - `meshes/*.obj` files contain ground-truth 3D meshes extracted from the volume segmentation masks.
+   - For original NIfTI files (.nii / .nii.gz), the raw data is located at `/mnt/nas1/disk01/weidongguo/dataset/TS` and contains the true `affine` transforms, voxel spacing, and world coordinates.
 
-2. If your dataset is already passed through nnUNet preprocessing, confirm whether you have original NIfTI files and if you can retrieve original `affine` metadata from them; otherwise, create a mapping file per case to store `affine` and real spacings.
+2. If you have legacy nnUNet preprocessed data, note that it may have removed or resampled spatial metadata. For accurate SAM3D reconstruction, use the provided preprocessing scripts to process raw NIfTI files directly. This ensures correct `affine`, spacing and orientation for pointmap computation.
 
-3. If `affine` is missing in preprocessed `.pkl`, re-associate it with the original NIfTI for accurate world coordinates and shape extraction.
+3. If `affine` is missing in preprocessed data, re-associate it with the original NIfTI for accurate world coordinates and shape extraction.
 
 ---
 

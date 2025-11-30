@@ -25,24 +25,24 @@ def compute_sdf(mask: np.ndarray) -> np.ndarray:
         and zero at the boundary.
     """
     mask = mask.astype(bool)
-    
+
     if mask.sum() == 0:
         # All background - return large positive distance
         return np.ones(mask.shape, dtype=np.float32) * 1e6
-    
+
     if (~mask).sum() == 0:
         # All foreground - return negative distance from edge
         return -ndimage.distance_transform_edt(mask).astype(np.float32)
-    
+
     # Distance transform for inside (foreground)
     dist_inside = ndimage.distance_transform_edt(mask)
-    
-    # Distance transform for outside (background) 
+
+    # Distance transform for outside (background)
     dist_outside = ndimage.distance_transform_edt(~mask)
-    
+
     # SDF: negative inside, positive outside
     sdf = dist_outside - dist_inside
-    
+
     return sdf.astype(np.float32)
 
 

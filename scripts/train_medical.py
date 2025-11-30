@@ -557,6 +557,50 @@ def create_dummy_model():
     return DummyMeshModel()
 
 
+def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
+    """Factory to create models by name.
+
+    Currently supports:
+    - "dummy": returns the existing dummy model (for unit testing only)
+    - "slat_mesh": returns a SLatMeshDecoder instance (for mesh training)
+
+    IMPORTANT: No silent fallbacks! If dependencies are missing, this will fail loudly.
+    """
+    params = params or {}
+    if name == "dummy":
+        return create_dummy_model()
+    if name == "slat_mesh":
+        # Import the real model - fail loudly if dependencies are missing
+        from sam3d_objects.model.backbone.tdfy_dit.models.structured_latent_vae.decoder_mesh import (
+            SLatMeshDecoder,
+        )
+
+        # Default small model params for quick tests; allow override via params
+        defaults = {
+            "resolution": int(params.get("resolution", 4)),
+            "model_channels": int(params.get("model_channels", 32)),
+            "latent_channels": int(params.get("latent_channels", 16)),
+            "num_blocks": int(params.get("num_blocks", 2)),
+            "num_heads": int(params.get("num_heads", 4)),
+            "use_fp16": bool(params.get("use_fp16", False)),
+            "use_checkpoint": bool(params.get("use_checkpoint", False)),
+            "device": params.get("device", "cuda"),
+            "representation_config": params.get("representation_config", {"use_color": False}),
+        }
+        return SLatMeshDecoder(
+            resolution=defaults["resolution"],
+            model_channels=defaults["model_channels"],
+            latent_channels=defaults["latent_channels"],
+            num_blocks=defaults["num_blocks"],
+            num_heads=defaults["num_heads"],
+            use_fp16=defaults["use_fp16"],
+            use_checkpoint=defaults["use_checkpoint"],
+            device=defaults["device"],
+            representation_config=defaults["representation_config"],
+        )
+    raise ValueError(f"Unknown model name: {name}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Medical fine-tuning for SAM3D")
 
@@ -589,11 +633,16 @@ def parse_args():
 
     # Hardware
     parser.add_argument("--device", type=str, default="cuda", help="Device")
-    parser.add_argument("--use_dataset", action="store_true", help="Use TS_SAM3D_Dataset instead of dummy data")
-    parser.add_argument("--data_root", type=str, default=None, help="Path to preprocessed data (slice cache) - used when --use_dataset is set")
+    parser.add_argument("--model_name", type=str, default="slat_mesh", help="Model to use (dummy|slat_mesh)")
+    parser.add_argument(
+        "--model_params",
+        type=str,
+        default=None,
+        help="JSON string of model params to pass to model factory",
+    )
     parser.add_argument("--slice_cache_dir", type=str, default=None, help="Slice cache dir override (defaults to data_root/slice_cache)")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
-    parser.add_argument("--augment", action="store_true", default=False, help="Enable per-slice augmentations when using dataset")
+    parser.add_argument("--augment", action="store_true", default=False, help="Enable per-slice augmentations")
     parser.add_argument("--no_mixed_precision", action="store_true", help="Disable mixed precision")
 
     return parser.parse_args()
@@ -606,63 +655,41 @@ def main():
     logger.info("Medical Fine-Tuning Script")
     logger.info(f"Args: {args}")
 
-    # Create data loader
-    if args.use_dataset:
-        logger.info("Creating TS_SAM3D_Dataset loader from data_root: %s", args.data_root)
-        if args.data_root is None:
-            raise ValueError("--data_root is required when --use_dataset is set")
-        from sam3d_objects.data.dataset.ts.ts_sam3d_dataloader import (
-            TS_SAM3D_Dataset,
-            data_collate,
-        )
-        slice_cache_dir = args.slice_cache_dir or (str(args.data_root) + "/slice_cache")
-        train_ds = TS_SAM3D_Dataset(
-            original_nifti_dir=args.data_root,
-            cache_slices=True,
-            slice_cache_dir=slice_cache_dir,
-            classes=1,
-            augment=args.augment,
-            augment_mode="train",
-            occupancy_threshold=0.01,
-        )
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=data_collate,
-            num_workers=args.num_workers,
-        )
-    else:
-        logger.info("Creating dummy data loaders for quick test runs")
-        from torch.utils.data import TensorDataset
-
-        dummy_images = torch.randn(100, 1, 256, 256)
-        dummy_pointmaps = torch.randn(100, 256, 256, 3)
-        dummy_sdfs = torch.randn(100, 1, 64, 64, 64)
-        dummy_masks = (torch.rand(100, 64, 64, 64) > 0.5).float()
-
-        train_dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
-
-        def collate_fn(batch):
-            images, pointmaps, sdfs, masks = zip(*batch)
-            return {
-                "image": torch.stack(images),
-                "pointmap": torch.stack(pointmaps),
-                "sdf": torch.stack(sdfs),
-                "mask": torch.stack(masks),
-            }
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=collate_fn,
-            num_workers=0,
-        )
+    # Create data loader - require real dataset, no dummy fallback
+    if args.data_root is None:
+        raise ValueError("--data_root is required. Provide path to preprocessed medical data.")
+    
+    logger.info("Creating TS_SAM3D_Dataset loader from data_root: %s", args.data_root)
+    from sam3d_objects.data.dataset.ts.ts_sam3d_dataloader import (
+        TS_SAM3D_Dataset,
+        data_collate,
+    )
+    slice_cache_dir = args.slice_cache_dir or (str(args.data_root) + "/slice_cache")
+    train_ds = TS_SAM3D_Dataset(
+        original_nifti_dir=args.data_root,
+        cache_slices=True,
+        slice_cache_dir=slice_cache_dir,
+        classes=1,
+        augment=args.augment,
+        augment_mode="train",
+        occupancy_threshold=0.01,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=data_collate,
+        num_workers=args.num_workers,
+    )
 
     # Create model
-    logger.info("Creating dummy model...")
-    model = create_dummy_model()
+    logger.info("Creating model: %s", args.model_name)
+    model_params = None
+    if args.model_params:
+        import json as _json
+
+        model_params = _json.loads(args.model_params)
+    model = create_model(name=args.model_name, params=model_params)
 
     # Create trainer
     trainer = MedicalTrainer(
@@ -726,8 +753,7 @@ def train_from_config(cfg: dict):
     args.resume = cfg.get("checkpoint", {}).get("resume", None)
     args.save_every = int(cfg.get("checkpoint", {}).get("save_every", 5))
 
-    # Data
-    args.use_dataset = bool(cfg.get("data", {}).get("use_dataset", True))
+    # Data - require real dataset
     args.data_root = cfg.get("data", {}).get("data_root")
     args.slice_cache_dir = cfg.get("data", {}).get("slice_cache_dir")
     args.augment = bool(cfg.get("data", {}).get("augment", False))
@@ -735,66 +761,40 @@ def train_from_config(cfg: dict):
     # Device
     args.device = cfg.get("device", "cuda")
 
-    # Build train_loader based on dataset flag
-    if args.use_dataset:
-        logger.info("(Hydra) Creating TS_SAM3D_Dataset loader from data_root: %s", args.data_root)
-        if args.data_root is None:
-            raise ValueError("data.data_root is required when use_dataset is true")
-        from sam3d_objects.data.dataset.ts.ts_sam3d_dataloader import (
-            TS_SAM3D_Dataset,
-            data_collate,
-        )
-        slice_cache_dir = args.slice_cache_dir or (str(args.data_root) + "/slice_cache")
-        train_ds = TS_SAM3D_Dataset(
-            original_nifti_dir=args.data_root,
-            cache_slices=True,
-            slice_cache_dir=slice_cache_dir,
-            classes=1,
-            augment=args.augment,
-            augment_mode="train",
-            occupancy_threshold=0.01,
-        )
-        from torch.utils.data import DataLoader
+    # Build train_loader - require real dataset, no dummy fallback
+    if args.data_root is None:
+        raise ValueError("data.data_root is required. Provide path to preprocessed medical data.")
+    
+    logger.info("(Hydra) Creating TS_SAM3D_Dataset loader from data_root: %s", args.data_root)
+    from sam3d_objects.data.dataset.ts.ts_sam3d_dataloader import (
+        TS_SAM3D_Dataset,
+        data_collate,
+    )
+    slice_cache_dir = args.slice_cache_dir or (str(args.data_root) + "/slice_cache")
+    train_ds = TS_SAM3D_Dataset(
+        original_nifti_dir=args.data_root,
+        cache_slices=True,
+        slice_cache_dir=slice_cache_dir,
+        classes=1,
+        augment=args.augment,
+        augment_mode="train",
+        occupancy_threshold=0.01,
+    )
+    from torch.utils.data import DataLoader
 
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=data_collate,
-            num_workers=args.num_workers,
-        )
-    else:
-        logger.info("(Hydra) Creating dummy data loaders for quick test runs")
-        from torch.utils.data import TensorDataset
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=data_collate,
+        num_workers=args.num_workers,
+    )
 
-        dummy_images = torch.randn(100, 1, 256, 256)
-        dummy_pointmaps = torch.randn(100, 256, 256, 3)
-        dummy_sdfs = torch.randn(100, 1, 64, 64, 64)
-        dummy_masks = (torch.rand(100, 64, 64, 64) > 0.5).float()
-
-        train_dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
-
-        def collate_fn(batch):
-            images, pointmaps, sdfs, masks = zip(*batch)
-            return {
-                "image": torch.stack(images),
-                "pointmap": torch.stack(pointmaps),
-                "sdf": torch.stack(sdfs),
-                "mask": torch.stack(masks),
-            }
-
-        from torch.utils.data import DataLoader
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=collate_fn,
-            num_workers=0,
-        )
-
-    # Create model & trainer and re-use logic
-    model = create_dummy_model()
+    # Create model & trainer
+    model_cfg = cfg.get("model", {})
+    model_name = model_cfg.get("name", "slat_mesh")
+    model_params = model_cfg.get("params", {})
+    model = create_model(name=model_name, params=model_params)
     trainer = MedicalTrainer(
         model=model,
         train_loader=train_loader,

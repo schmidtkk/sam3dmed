@@ -25,7 +25,7 @@ os.environ.setdefault('LIDRA_SKIP_INIT', '1')
 from scripts.train_medical import train_from_config
 
 
-@hydra.main(config_path=str(root / 'configs'), config_name='train')
+@hydra.main(version_base="1.1", config_path=str(root / 'configs'), config_name='train')
 def main(cfg: DictConfig) -> None:
     print("Hydra config loaded:\n", OmegaConf.to_yaml(cfg))
     train_from_config(OmegaConf.to_container(cfg, resolve=True))

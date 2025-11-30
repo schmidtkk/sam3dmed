@@ -1,6 +1,13 @@
 __pycache__
-# Preprocessed data
-nnUNet_preprocessed/
+# Preprocessed data (ts_processed, etc.)
 *.b2nd
 *.pkl
 paper.pdf
+dataset/
+*.npz
+*.nii.gz
+outputs/
+results/
+
+# NFS temp files
+.nfs*

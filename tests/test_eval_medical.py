@@ -319,6 +319,50 @@ class TestEvaluatorIntegration:
         assert "config" in saved
         assert "timestamp" in saved
 
+    def test_visualization_outputs(self, tmp_path):
+        """Test that evaluation visualization files are produced when requested."""
+        model = create_dummy_model()
+
+        # Create dataset
+        import torch
+        from torch.utils.data import DataLoader, TensorDataset
+
+        dummy_images = torch.randn(2, 1, 256, 256)
+        dummy_pointmaps = torch.randn(2, 256, 256, 3)
+        dummy_sdfs = torch.randn(2, 256, 256, 1)
+        dummy_masks = (torch.rand(2, 256, 256) > 0.5).float()
+
+        dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
+
+        def collate_fn(batch):
+            images, pointmaps, sdfs, masks = zip(*batch)
+            return {
+                "image": torch.stack(images),
+                "pointmap": torch.stack(pointmaps),
+                "sdf": torch.stack(sdfs),
+                "mask": torch.stack(masks),
+            }
+
+        loader = DataLoader(dataset, batch_size=1, collate_fn=collate_fn)
+
+        evaluator = MedicalEvaluator(
+            model=model,
+            data_loader=loader,
+            device="cpu",
+            output_dir=str(tmp_path),
+        )
+
+        evaluator.evaluate(save_predictions=False, visualize=True, visualize_every=1, visualize_format="html")
+
+        viz_dir = tmp_path / "visualizations"
+        assert viz_dir.exists()
+        # Check presence of a sample folder with content
+        subdirs = list(viz_dir.glob("batch_*"))
+        assert len(subdirs) > 0
+        # Check at least one file exists inside a sample directory
+        files = list(subdirs[0].glob("**/*"))
+        assert len(files) > 0
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
