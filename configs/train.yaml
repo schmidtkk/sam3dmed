@@ -44,7 +44,7 @@ model:
   name: slat_mesh
   params:
     resolution: 4
-    model_channels: 32
+    model_channels: 256
     latent_channels: 16
     num_blocks: 2
     num_heads: 4

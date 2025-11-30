@@ -13,6 +13,13 @@ Usage:
         --lr 1e-3
 """
 
+import os
+
+# Skip LIDRA initialization - sam3d_objects.init module does not exist in this fork.
+# LIDRA was the original internal codename/framework. This fork removed it but kept
+# the conditional import guard for compatibility.
+os.environ.setdefault('LIDRA_SKIP_INIT', '1')
+
 import argparse
 import json
 import sys
@@ -248,9 +255,12 @@ class MedicalTrainer:
         lora_alpha: float = 8.0,
         checkpoint_dir: str = "./checkpoints",
         grad_accum_steps: int = 1,
+        grad_clip_norm: float = 1.0,
         mixed_precision: bool = True,
         device: str = "cuda",
         loss_config: dict | None = None,
+        slat_generator_ckpt: str | None = None,
+        slat_generator_params: dict | None = None,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -262,7 +272,10 @@ class MedicalTrainer:
         self.lora_alpha = lora_alpha
         self.checkpoint_dir = Path(checkpoint_dir)
         self.grad_accum_steps = grad_accum_steps
+        self.grad_clip_norm = grad_clip_norm
         self.mixed_precision = mixed_precision
+        self.slat_generator_ckpt = slat_generator_ckpt
+        self.slat_generator_params = slat_generator_params or {}
 
         # Setup checkpoint directory
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -273,6 +286,26 @@ class MedicalTrainer:
 
         # Setup LoRA
         self._setup_lora()
+        # Optionally load slat generator for mesh decoder training
+        self.slat_generator = None
+        if self.slat_generator_ckpt is not None:
+            try:
+                logger.info(f"Loading slat generator checkpoint: {self.slat_generator_ckpt}")
+                # Instantiate using `create_model` for flexible small generator setup
+                self.slat_generator = create_model(name="slat_generator", params=self.slat_generator_params)
+                from sam3d_objects.model.io import load_model_from_checkpoint
+
+                self.slat_generator = load_model_from_checkpoint(
+                    self.slat_generator,
+                    self.slat_generator_ckpt,
+                    strict=False,
+                    device=self.device,
+                    freeze=True,
+                    eval=True,
+                )
+                logger.info("Slat generator loaded and set to eval mode")
+            except Exception as e:
+                logger.warning("Failed to load slat generator: %s", e)
 
         # Setup optimizer (only for trainable params)
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
@@ -332,6 +365,16 @@ class MedicalTrainer:
 
             # Gradient accumulation
             if (batch_idx + 1) % self.grad_accum_steps == 0:
+                # Gradient clipping to prevent NaN/explosion
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                
+                if self.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.model.parameters() if p.requires_grad],
+                        self.grad_clip_norm
+                    )
+                
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -447,27 +490,153 @@ class MedicalTrainer:
         Forward pass through model.
 
         Override this method for custom model architectures.
+        Supports both:
+        - Standard models that accept (image, pointmap)
+        - SLatMeshDecoder that requires a SparseTensor input
         """
         # Extract inputs
         image = batch.get("image")
         pointmap = batch.get("pointmap")
+        mask = batch.get("mask")
+
+        # Sanitize inputs: replace NaN/inf to prevent propagation through Linear layers
+        # The dataset uses NaN for background pixels in pointmaps
+        if pointmap is not None and not torch.isfinite(pointmap).all():
+            pointmap = torch.nan_to_num(pointmap, nan=0.0, posinf=0.0, neginf=0.0)
+        if image is not None and not torch.isfinite(image).all():
+            image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Forward pass (model-specific)
-        # This is a placeholder - actual implementation depends on model
-        outputs = self.model(image, pointmap)
+        # Check if model expects a SparseTensor (e.g., SLatMeshDecoder)
+        model_class_name = self.model.__class__.__name__
+        if "SLatMeshDecoder" in model_class_name or "SLatDecoder" in model_class_name:
+            # Create SparseTensor from batch data
+            slat_input = self._create_sparse_tensor_from_batch(batch, image, pointmap, mask)
+            outputs = self.model(slat_input)
+        else:
+            # Standard forward with (image, pointmap)
+            outputs = self.model(image, pointmap)
 
         return outputs
 
+    def _create_sparse_tensor_from_batch(
+        self,
+        batch: dict,
+        image: torch.Tensor,
+        pointmap: torch.Tensor,
+        mask: torch.Tensor | None,
+    ):
+        """
+        Create a SparseTensor from batch data for SLatMeshDecoder.
+
+        The SparseTensor represents a 3D structured latent with:
+        - coords: (N, 4) with [batch_idx, x, y, z] for each occupied voxel
+        - feats: (N, C) features at each occupied voxel
+
+        For 2D medical slices, we create a thin 3D volume (depth=1) and use
+        the mask to determine occupied positions.
+        """
+        from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
+
+        B = image.shape[0]
+        device = image.device
+        dtype = image.dtype
+
+        # Get resolution from model
+        resolution = getattr(self.model, "resolution", 4)
+        latent_channels = getattr(self.model, "in_channels", 16)
+
+        # Create synthetic 3D coordinates from 2D mask
+        # For each batch, create a small grid of occupied voxels
+        all_coords = []
+        all_feats = []
+
+        for b in range(B):
+            # Use mask to find foreground pixels, or create a uniform grid
+            if mask is not None and mask.ndim >= 2:
+                # Downsample mask to resolution x resolution
+                mask_b = mask[b] if mask.ndim > 2 else mask
+                if mask_b.ndim == 3:  # (C, H, W)
+                    mask_b = mask_b[0]  # Take first channel
+                # Resize to resolution x resolution
+                mask_resized = F.interpolate(
+                    mask_b.unsqueeze(0).unsqueeze(0).float(),
+                    size=(resolution, resolution),
+                    mode="nearest",
+                ).squeeze()
+                # Get non-zero positions
+                occupied = (mask_resized > 0.5).nonzero(as_tuple=False)
+                if occupied.shape[0] == 0:
+                    # No foreground - create a single center voxel
+                    occupied = torch.tensor([[resolution // 2, resolution // 2]], device=device)
+            else:
+                # No mask - create a full grid
+                y_coords, x_coords = torch.meshgrid(
+                    torch.arange(resolution, device=device),
+                    torch.arange(resolution, device=device),
+                    indexing="ij",
+                )
+                occupied = torch.stack([y_coords.flatten(), x_coords.flatten()], dim=1)
+
+            num_voxels = occupied.shape[0]
+            # Create 3D coords: (N, 4) with [batch_idx, x, y, z]
+            # Use z=0 for 2D slices (thin volume)
+            batch_idx = torch.full((num_voxels, 1), b, device=device, dtype=torch.int32)
+            x_coords = occupied[:, 1:2].int()  # column index
+            y_coords = occupied[:, 0:1].int()  # row index
+            z_coords = torch.zeros((num_voxels, 1), device=device, dtype=torch.int32)
+            coords_b = torch.cat([batch_idx, x_coords, y_coords, z_coords], dim=1)
+            all_coords.append(coords_b)
+
+            # Create features for each voxel
+            # Use image features pooled to resolution, then sample at occupied positions
+            if image is not None:
+                img_b = image[b]  # (C, H, W)
+                img_resized = F.interpolate(
+                    img_b.unsqueeze(0),
+                    size=(resolution, resolution),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)  # (C, res, res)
+                # Sample at occupied positions
+                feats_b = img_resized[:, occupied[:, 0], occupied[:, 1]].T  # (N, C)
+                # Pad or project to latent_channels
+                if feats_b.shape[1] < latent_channels:
+                    feats_b = F.pad(feats_b, (0, latent_channels - feats_b.shape[1]))
+                elif feats_b.shape[1] > latent_channels:
+                    feats_b = feats_b[:, :latent_channels]
+            else:
+                # Random features
+                feats_b = torch.randn((num_voxels, latent_channels), device=device, dtype=dtype)
+
+            all_feats.append(feats_b)
+
+        # Concatenate all batches
+        coords = torch.cat(all_coords, dim=0)
+        # Use float32 for features to avoid mixed precision issues in mesh extraction
+        feats = torch.cat(all_feats, dim=0).float()
+
+        # Create SparseTensor
+        sparse_tensor = sp.SparseTensor(feats=feats, coords=coords)
+        return sparse_tensor
+
     def _compute_losses(
         self,
-        outputs: dict,
+        outputs,
         batch: dict,
     ) -> dict[str, torch.Tensor]:
         """
         Compute losses from model outputs and batch.
 
-        Override this method for custom loss computation.
+        Handles both:
+        - dict outputs from simple models (e.g., DummyMeshModel)
+        - List[MeshExtractResult] from SLatMeshDecoder
         """
+        # Handle List[MeshExtractResult] from SLatMeshDecoder
+        if isinstance(outputs, list):
+            return self._compute_mesh_losses(outputs, batch)
+
+        # Standard dict output
         # Extract predictions
         pred_sdf = outputs.get("sdf")
         pred_vertices = outputs.get("vertices")
@@ -475,9 +644,14 @@ class MedicalTrainer:
         pred_occupancy = outputs.get("occupancy")
 
         # Extract ground truth - handle both 'sdf' and 'mask_sdf' keys
-        gt_sdf = batch.get("sdf") or batch.get("mask_sdf")
+        # Use explicit None check to avoid boolean tensor evaluation error
+        gt_sdf = batch.get("sdf")
+        if gt_sdf is None:
+            gt_sdf = batch.get("mask_sdf")
         gt_vertices = batch.get("vertices")
-        gt_occupancy = batch.get("mask") or batch.get("segmentation")
+        gt_occupancy = batch.get("mask")
+        if gt_occupancy is None:
+            gt_occupancy = batch.get("segmentation")
 
         return self.losses(
             pred_sdf=pred_sdf,
@@ -488,6 +662,91 @@ class MedicalTrainer:
             pred_occupancy=pred_occupancy,
             gt_occupancy=gt_occupancy,
         )
+
+    def _compute_mesh_losses(
+        self,
+        mesh_results: list,
+        batch: dict,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Compute losses from List[MeshExtractResult] output.
+
+        MeshExtractResult has:
+        - vertices: (V, 3) mesh vertices
+        - faces: (F, 3) mesh faces
+        - tsdf_v, tsdf_s: TSDF values (for training)
+        - reg_loss: regularization loss from mesh extraction
+        """
+        device = self.device
+        reg_losses = []
+        vertex_losses = []
+
+        # Extract ground truth mask for occupancy-based loss
+        gt_mask = batch.get("mask")
+        if gt_mask is None:
+            gt_mask = batch.get("segmentation")
+
+        for i, mesh in enumerate(mesh_results):
+            if not mesh.success:
+                # Empty mesh - skip (no gradients to propagate)
+                continue
+
+            # Regularization loss from FlexiCubes (this has gradients)
+            if mesh.reg_loss is not None and mesh.reg_loss.requires_grad:
+                reg_losses.append(mesh.reg_loss)
+
+            # Vertex-based occupancy loss: encourage vertices within mask region
+            if gt_mask is not None and mesh.vertices.shape[0] > 0 and mesh.vertices.requires_grad:
+                # Normalize vertex positions to [0, 1] range for comparison with mask
+                verts = mesh.vertices  # (V, 3)
+                v_min = verts.min(dim=0)[0]
+                v_max = verts.max(dim=0)[0]
+                v_range = (v_max - v_min).clamp(min=1e-6)
+                verts_norm = (verts - v_min) / v_range  # (V, 3) in [0, 1]
+
+                # Project to 2D (use x, y for now) and sample mask
+                mask_i = gt_mask[i] if gt_mask.ndim > 2 else gt_mask
+                if mask_i.ndim == 3:
+                    mask_i = mask_i[0]  # (H, W)
+
+                # Sample mask at vertex positions
+                grid_x = (verts_norm[:, 0] * 2 - 1).clamp(-1, 1)  # to [-1, 1]
+                grid_y = (verts_norm[:, 1] * 2 - 1).clamp(-1, 1)
+                grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1, V, 2)
+                mask_sampled = F.grid_sample(
+                    mask_i.unsqueeze(0).unsqueeze(0).float(),
+                    grid,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=True,
+                ).squeeze()  # (V,)
+
+                # Loss: vertices should be in foreground (mask > 0.5)
+                vertex_loss = F.binary_cross_entropy_with_logits(
+                    mask_sampled, torch.ones_like(mask_sampled),
+                    reduction="mean"
+                )
+                vertex_losses.append(vertex_loss)
+
+        # Combine losses - ensure we have at least one differentiable loss
+        if len(reg_losses) > 0:
+            reg_loss = torch.stack(reg_losses).mean()
+        else:
+            reg_loss = torch.zeros(1, device=device, requires_grad=True).squeeze()
+
+        if len(vertex_losses) > 0:
+            vertex_loss = torch.stack(vertex_losses).mean()
+        else:
+            vertex_loss = torch.zeros(1, device=device, requires_grad=True).squeeze()
+
+        total_loss = reg_loss * self.losses.mesh_reg_weight + vertex_loss
+
+        losses = {
+            "total": total_loss,
+            "reg": reg_loss.detach(),
+            "vertex": vertex_loss.detach(),
+        }
+        return losses
 
     def _to_device(self, batch: dict) -> dict:
         """Move batch tensors to device."""
@@ -643,7 +902,7 @@ def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
         # Default small model params for quick tests; allow override via params
         defaults = {
             "resolution": int(params.get("resolution", 4)),
-            "model_channels": int(params.get("model_channels", 32)),
+            "model_channels": int(params.get("model_channels", 256)),
             "latent_channels": int(params.get("latent_channels", 16)),
             "num_blocks": int(params.get("num_blocks", 2)),
             "num_heads": int(params.get("num_heads", 4)),
@@ -652,6 +911,18 @@ def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
             "device": params.get("device", "cuda"),
             "representation_config": params.get("representation_config", {"use_color": False}),
         }
+        # Validate that the default model_channels yields valid group norm sizes
+        # For SparseGroupNorm32 we use num_groups=32 and the decoder upsample
+        # computes out_channels = model_channels // 4 and // 8. Both must be
+        # divisible by num_groups. This implies model_channels must be divisible
+        # by 8 * num_groups (i.e., 256 when num_groups=32).
+        num_groups = 32
+        if defaults["model_channels"] % (8 * num_groups) != 0:
+            raise ValueError(
+                "Invalid 'model_channels' for SLatMeshDecoder; model_channels must be a multiple "
+                f"of {8 * num_groups} (8 * num_groups), e.g., 256. Found {defaults['model_channels']}"
+            )
+
         return SLatMeshDecoder(
             resolution=defaults["resolution"],
             model_channels=defaults["model_channels"],
@@ -663,6 +934,39 @@ def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
             device=defaults["device"],
             representation_config=defaults["representation_config"],
         )
+    if name == "slat_generator":
+        # Instantiate the slat generator (SLatFlowModelTdfyWrapper) for training/testing
+        from sam3d_objects.model.backbone.tdfy_dit.models.structured_latent_flow import (
+            SLatFlowModelTdfyWrapper,
+        )
+
+        defaults = {
+            "resolution": int(params.get("resolution", 4)),
+            "in_channels": int(params.get("in_channels", 1)),
+            "model_channels": int(params.get("model_channels", 256)),
+            "cond_channels": int(params.get("cond_channels", 3)),
+            "out_channels": int(params.get("out_channels", 8)),
+            "num_blocks": int(params.get("num_blocks", 2)),
+            "num_heads": int(params.get("num_heads", 4)),
+            "use_fp16": bool(params.get("use_fp16", False)),
+            "use_checkpoint": bool(params.get("use_checkpoint", False)),
+            # Do not pass a `device` kwarg to the backbone constructors - call .to(device) instead
+            "io_block_channels": params.get("io_block_channels", [64, 128, 256]),
+        }
+        model = SLatFlowModelTdfyWrapper(
+            resolution=defaults["resolution"],
+            in_channels=defaults["in_channels"],
+            model_channels=defaults["model_channels"],
+            cond_channels=defaults["cond_channels"],
+            out_channels=defaults["out_channels"],
+            num_blocks=defaults["num_blocks"],
+            num_heads=defaults["num_heads"],
+            use_fp16=defaults["use_fp16"],
+            use_checkpoint=defaults["use_checkpoint"],
+            io_block_channels=defaults["io_block_channels"],
+        )
+        # Move to device in the caller and return the generator instance
+        return model
     raise ValueError(f"Unknown model name: {name}")
 
 
@@ -683,6 +987,19 @@ def parse_args():
     # LoRA
     parser.add_argument("--lora_rank", type=int, default=4, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=float, default=8.0, help="LoRA alpha")
+    # Optional slat generator (for producing latents for mesh decoder training)
+    parser.add_argument(
+        "--slat_generator_ckpt",
+        type=str,
+        default=None,
+        help="Path to slat generator checkpoint to produce slat latents for mesh decoder",
+    )
+    parser.add_argument(
+        "--slat_generator_params",
+        type=str,
+        default=None,
+        help="JSON string of model params to pass to slat generator factory",
+    )
 
     # Loss weights
     parser.add_argument("--sdf_weight", type=float, default=1.0, help="SDF loss weight")
@@ -774,6 +1091,8 @@ def main():
             "chamfer_weight": args.chamfer_weight,
             "mesh_reg_weight": args.mesh_reg_weight,
         },
+        slat_generator_ckpt=args.slat_generator_ckpt,
+        slat_generator_params=json.loads(args.slat_generator_params) if args.slat_generator_params else None,
     )
 
     # Resume if specified
