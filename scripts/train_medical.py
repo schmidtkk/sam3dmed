@@ -319,6 +319,8 @@ class MedicalTrainer:
             # Forward pass with mixed precision
             with torch.amp.autocast("cuda", enabled=self.mixed_precision):
                 outputs = self._forward_step(batch)
+                # Debug: detect non-finite tensors early to find NaN sources
+                self._detect_nonfinite_tensors(batch, outputs, batch_idx)
                 losses = self._compute_losses(outputs, batch)
                 loss = losses["total"] / self.grad_accum_steps
 
@@ -492,6 +494,40 @@ class MedicalTrainer:
         return {
             k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()
         }
+
+    def _detect_nonfinite_tensors(self, batch: dict, outputs: dict, batch_idx: int) -> None:
+        """Log any non-finite tensors found in the batch or outputs for debugging.
+
+        This helper is enabled only when SANITY_DEBUG env var is set to '1'.
+        """
+        import os
+
+        if os.environ.get("SANITY_DEBUG") != "1":
+            return
+
+        def _check_tensor(name, t):
+            if t is None:
+                return
+            if not isinstance(t, torch.Tensor):
+                return
+            if not t.isfinite().all():
+                nans = (~t.isfinite()).sum().item()
+                logger.warning(f"Non-finite detected in {name} at batch {batch_idx}: count={nans}, shape={t.shape}")
+            else:
+                # Optionally log min/max for numeric issues
+                try:
+                    t_min = t.min().item()
+                    t_max = t.max().item()
+                except Exception:
+                    t_min, t_max = None, None
+                logger.debug(f"{name} finite: shape={t.shape}, min={t_min}, max={t_max}")
+
+        # Check some expected keys
+        for k in ("image", "pointmap", "mask_sdf", "segmentation"):
+            if k in batch:
+                _check_tensor(f"batch.{k}", batch[k])
+        for k, v in outputs.items():
+            _check_tensor(f"outputs.{k}", v)
 
     def _aggregate_losses(self, losses_list: list[dict]) -> dict[str, float]:
         """Aggregate list of loss dicts into means."""
