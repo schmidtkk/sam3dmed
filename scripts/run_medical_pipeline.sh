@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Skip LIDRA initialization in this fork (LIDRA was an internal init module removed from this repo)
+export LIDRA_SKIP_INIT=1
+
 # Run preprocessing, training and evaluation for SAM3D medical fine-tuning.
 # Usage:
 #   ./scripts/run_medical_pipeline.sh --raw_nifti /path/to/raw --out /path/to/preprocessed \
@@ -14,6 +17,7 @@ set -euo pipefail
 #   --batch_size <n>      Batch size (default: 4)
 #   --lr <float>          Learning rate (default: 1e-3)
 #   --device <str>        Device (cuda|cpu) (default: cuda)
+#   --gpu <str>           Comma-separated CUDA_VISIBLE_DEVICES (e.g., 0 or 0,1) (default: unset)
 #   --no_preprocess       Skip preprocessing step if preprocessed data already exists
 #   --only_preprocess     Only run preprocessing and exit
 #   --only_train          Only run training (requires preprocessed data)
@@ -33,6 +37,7 @@ ONLY_TRAIN=0
 ONLY_EVAL=0
 RESUME=""
 NUM_WORKERS=4
+CUDA_DEVICE="1"
 LORA_RANK=4
 LORA_ALPHA=8.0
 CHECKPOINT_DIR="./checkpoints/medical"
@@ -65,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --checkpoint_dir) CHECKPOINT_DIR="$2"; shift 2;;
     --eval_dir) EVAL_DIR="$2"; shift 2;;
     --help) usage; exit 0;;
+    --gpu) CUDA_DEVICE="$2"; shift 2;;
     *) echo "Unknown arg: $1"; usage; exit 1;;
   esac
 done
@@ -81,14 +87,20 @@ if [[ -z "${OUT_DIR:-}" ]]; then
   exit 1
 fi
 
+# Export GPU env var if provided
+if [[ -n "${CUDA_DEVICE:-}" ]]; then
+  echo "Using CUDA visible device: $CUDA_DEVICE"
+  export CUDA_VISIBLE_DEVICES="$CUDA_DEVICE"
+fi
+
 # Activate conda environment if available
+PY_CMD=""
 if command -v conda >/dev/null 2>&1; then
-  echo "Activating conda environment: sam3d-objects"
-  # shellcheck disable=SC1091
-  source ~/.bashrc || true
-  conda activate sam3d-objects || true
+  echo "Conda detected; using 'conda run -n sam3d-objects' to execute Python commands"
+  PY_CMD=(conda run -n sam3d-objects)
 else
-  echo "Warning: conda not found; ensure python environment has dependencies installed"
+  echo "Warning: conda not found; using system Python instead. Ensure correct environment is active"
+  PY_CMD=(python3)
 fi
 
 # Ensure out dirs
@@ -101,7 +113,7 @@ mkdir -p "$CHECKPOINT_DIR" "$EVAL_DIR"
 # 1) Preprocessing
 if [[ $NO_PREPROCESS -eq 0 && $ONLY_TRAIN -eq 0 && $ONLY_EVAL -eq 0 ]]; then
   echo "[Pipeline] Running preprocessing: $RAW_NIFTI -> $OUT_DIR"
-  python3 scripts/reprocess_ts_nifti.py \
+  "${PY_CMD[@]}" python3 scripts/reprocess_ts_nifti.py \
     --original_nifti_dir "$RAW_NIFTI" \
     --out_dir "$OUT_DIR" \
     --classes "$CLASSES" \
@@ -124,7 +136,7 @@ if [[ $ONLY_EVAL -eq 0 ]]; then
   # to the real dataset loader (TS_SAM3D_Dataset). Using direct CLI keeps the script
   # simple and avoids inline Python.
   TRAIN_CMD=(
-    python3
+    "${PY_CMD[@]}" python3
     scripts/train_medical_hydra.py
     "data.use_dataset=true"
     "data.data_root=$OUT_DIR"
@@ -141,6 +153,12 @@ if [[ $ONLY_EVAL -eq 0 ]]; then
 
   if [[ -n "$RESUME" ]]; then
     TRAIN_CMD+=("checkpoint.resume=$RESUME")
+  fi
+
+  # If the preprocessed ts cache exists inside OUT_DIR, add it as override to the hydra config
+  if [[ -d "$OUT_DIR/ts_processed" ]]; then
+    TRAIN_CMD+=("data.slice_cache_dir=$OUT_DIR/ts_processed")
+    echo "Using slice_cache_dir: $OUT_DIR/ts_processed"
   fi
 
   "${TRAIN_CMD[@]}" || { echo "Training failed"; exit 1; }
@@ -164,7 +182,7 @@ fi
 
 if [[ $ONLY_PREPROCESS -eq 0 && $ONLY_TRAIN -eq 0 && $ONLY_EVAL -eq 0 ]] || [[ $ONLY_EVAL -eq 1 ]]; then
   echo "[Pipeline] Running evaluation against checkpoint: $RESUME"
-  python3 scripts/eval_medical.py --checkpoint "$RESUME" --data_root "$OUT_DIR" --output_dir "$EVAL_DIR" --device "$DEVICE" --save_predictions || { echo "Evaluation failed"; exit 1; }
+  "${PY_CMD[@]}" scripts/eval_medical.py --checkpoint "$RESUME" --data_root "$OUT_DIR" --output_dir "$EVAL_DIR" --device "$DEVICE" --save_predictions || { echo "Evaluation failed"; exit 1; }
   echo "[Pipeline] Evaluation complete; results in $EVAL_DIR"
 fi
 

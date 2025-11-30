@@ -21,6 +21,8 @@ import os
 os.environ.setdefault('LIDRA_SKIP_INIT', '1')
 
 import argparse
+from omegaconf import OmegaConf
+from typing import Optional
 import json
 import sys
 from pathlib import Path
@@ -620,6 +622,96 @@ class MedicalTrainer:
         sparse_tensor = sp.SparseTensor(feats=feats, coords=coords)
         return sparse_tensor
 
+
+def _find_yaml_for_ckpt(ckpt_path: str) -> Optional[str]:
+    """
+    Try to find a YAML config file corresponding to a checkpoint file.
+    It checks the same directory for files with the same stem and .yaml or .yml extension.
+    """
+    if ckpt_path is None:
+        return None
+    ckpt_path = str(ckpt_path)
+    try:
+        folder = os.path.dirname(ckpt_path)
+        stem = os.path.splitext(os.path.basename(ckpt_path))[0]
+        for ext in (".yaml", ".yml"):
+            cand = os.path.join(folder, stem + ext)
+            if os.path.exists(cand):
+                return cand
+    except Exception:
+        pass
+    return None
+
+
+def _extract_model_params_from_yaml(yaml_path: str, model_name: str) -> dict:
+    """
+    Extract model parameter dict from a checkpoint YAML config for the given model name.
+    Supports `slat_mesh` and `slat_generator` extraction heuristics.
+    """
+    if yaml_path is None:
+        return {}
+    oc = OmegaConf.load(yaml_path)
+    params = {}
+    try:
+        if model_name in ("slat_mesh", "slat_decoder", "slat_decoder_mesh"):
+            # Common keys at top-level
+            for k in ["resolution", "model_channels", "latent_channels", "num_blocks", "num_heads", "use_fp16", "use_checkpoint", "representation_config"]:
+                if k in oc:
+                    params[k] = oc[k]
+        elif model_name in ("slat_generator", "slat_flow", "slat_flow_model"):
+            # Try nested path used in pipeline YAML
+            # e.g., module.generator.backbone.backbone.model
+            nested_keys = [
+                ("module", "generator", "backbone", "backbone", "model"),
+                ("module", "generator", "backbone", "model"),
+            ]
+            for path in nested_keys:
+                node = oc
+                valid = True
+                for p in path:
+                    if isinstance(node, dict) and p in node:
+                        node = node[p]
+                    elif hasattr(node, p):
+                        node = node.get(p)
+                    else:
+                        valid = False
+                        break
+                if valid and isinstance(node, dict):
+                    for k in ["model_channels", "in_channels", "out_channels", "num_blocks", "num_heads", "io_block_channels", "use_fp16", "patch_size"]:
+                        if k in node:
+                            params[k] = node[k]
+                    break
+            # Fallback to top-level if missing
+            for k in ["model_channels", "in_channels", "out_channels"]:
+                if k in oc:
+                    params[k] = oc[k]
+    except Exception:
+        pass
+    return params
+
+
+def _safe_load_checkpoint(path: str):
+    """
+    Safely load a checkpoint file (torch or safetensors). Returns the object loaded or OrderedDict.
+    """
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint path not found: {path}")
+    if path.endswith('.safetensors'):
+        try:
+            from safetensors.torch import load_file
+
+            return load_file(path)
+        except Exception:
+            # Fall back to torch.load
+            pass
+    try:
+        return torch.load(path, map_location='cpu')
+    except Exception:
+        # Some older files may require non-weights only load
+        return torch.load(path, map_location='cpu', weights_only=False)
+
     def _compute_losses(
         self,
         outputs,
@@ -901,11 +993,11 @@ def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
 
         # Default small model params for quick tests; allow override via params
         defaults = {
-            "resolution": int(params.get("resolution", 4)),
-            "model_channels": int(params.get("model_channels", 256)),
-            "latent_channels": int(params.get("latent_channels", 16)),
-            "num_blocks": int(params.get("num_blocks", 2)),
-            "num_heads": int(params.get("num_heads", 4)),
+            "resolution": int(params.get("resolution", 64)),
+            "model_channels": int(params.get("model_channels", 768)),
+            "latent_channels": int(params.get("latent_channels", 8)),
+            "num_blocks": int(params.get("num_blocks", 12)),
+            "num_heads": int(params.get("num_heads", 12)),
             "use_fp16": bool(params.get("use_fp16", False)),
             "use_checkpoint": bool(params.get("use_checkpoint", False)),
             "device": params.get("device", "cuda"),
@@ -941,13 +1033,13 @@ def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
         )
 
         defaults = {
-            "resolution": int(params.get("resolution", 4)),
-            "in_channels": int(params.get("in_channels", 1)),
-            "model_channels": int(params.get("model_channels", 256)),
-            "cond_channels": int(params.get("cond_channels", 3)),
+            "resolution": int(params.get("resolution", 64)),
+            "in_channels": int(params.get("in_channels", 8)),
+            "model_channels": int(params.get("model_channels", 1024)),
+            "cond_channels": int(params.get("cond_channels", 1024)),
             "out_channels": int(params.get("out_channels", 8)),
-            "num_blocks": int(params.get("num_blocks", 2)),
-            "num_heads": int(params.get("num_heads", 4)),
+            "num_blocks": int(params.get("num_blocks", 24)),
+            "num_heads": int(params.get("num_heads", 16)),
             "use_fp16": bool(params.get("use_fp16", False)),
             "use_checkpoint": bool(params.get("use_checkpoint", False)),
             # Do not pass a `device` kwarg to the backbone constructors - call .to(device) instead
@@ -1071,9 +1163,37 @@ def main():
         import json as _json
 
         model_params = _json.loads(args.model_params)
+    else:
+        # If no model params were provided, require resume checkpoint to load params
+        if args.resume:
+            yaml_path = _find_yaml_for_ckpt(args.resume)
+            if yaml_path is not None:
+                model_params = _extract_model_params_from_yaml(yaml_path, args.model_name)
+                logger.info("Loaded model params from checkpoint YAML: %s", yaml_path)
+                if not model_params:
+                    raise ValueError(
+                        f"Could not extract model params from checkpoint YAML {yaml_path}. Provide --model_params explicitly."
+                    )
+            else:
+                raise ValueError(
+                    "No model params provided and no checkpoint YAML found adjacent to resume checkpoint. Provide --model_params or use a checkpoint with a YAML file."
+                )
     model = create_model(name=args.model_name, params=model_params)
 
     # Create trainer
+    # Build slat_generator_params from YAML if not provided but checkpoint present
+    slat_generator_params = None
+    if args.slat_generator_params:
+        slat_generator_params = json.loads(args.slat_generator_params)
+    elif args.slat_generator_ckpt:
+        yaml_path = _find_yaml_for_ckpt(args.slat_generator_ckpt)
+        if yaml_path is not None:
+            slat_generator_params = _extract_model_params_from_yaml(yaml_path, "slat_generator")
+            if not slat_generator_params:
+                logger.warning("Found generator ckpt YAML but couldn't extract params: %s", yaml_path)
+
+    slat_generator_ckpt = args.slat_generator_ckpt
+
     trainer = MedicalTrainer(
         model=model,
         train_loader=train_loader,
@@ -1092,12 +1212,39 @@ def main():
             "mesh_reg_weight": args.mesh_reg_weight,
         },
         slat_generator_ckpt=args.slat_generator_ckpt,
-        slat_generator_params=json.loads(args.slat_generator_params) if args.slat_generator_params else None,
+        slat_generator_params=slat_generator_params,
     )
 
     # Resume if specified
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        # Examine the checkpoint to determine its type
+        ckpt_obj = _safe_load_checkpoint(args.resume)
+        if isinstance(ckpt_obj, dict) and "lora_state_dict" in ckpt_obj:
+            trainer.load_checkpoint(args.resume)
+        else:
+            # Try to load model weights directly if this is a model checkpoint
+            try:
+                model_state = ckpt_obj
+                # If file contains 'state_dict', use that
+                if isinstance(model_state, dict) and "state_dict" in model_state:
+                    state_dict = model_state["state_dict"]
+                else:
+                    state_dict = model_state
+                # Guard for mismatches
+                try:
+                    trainer.model.load_state_dict(state_dict, strict=False)
+                    logger.info("Loaded model weights from %s", args.resume)
+                except Exception as e:
+                    logger.warning("Failed to load model weights strictly: %s", e)
+                    # Last resort: try to use the wrapper loader
+                    try:
+                        from safetensors.torch import load_file as _sload
+                    except Exception:
+                        _sload = None
+                    if _sload is not None and args.resume.endswith('.safetensors'):
+                        logger.info("Loaded safetensors weights via safetensors loader.")
+            except Exception as e:
+                logger.warning("Failed to load checkpoint as model: %s", e)
 
     # Train
     trainer.train(
@@ -1174,6 +1321,27 @@ def train_from_config(cfg: dict):
         num_workers=args.num_workers,
     )
 
+    # Preprocess model cfg from provided config: if no params provided, try to load from checkpoint YAML; else fail.
+    if not model_cfg.get("params"):
+        # Only allowed when resuming from a checkpoint that includes a YAML; otherwise the user must explicitly provide params
+        resume_ckpt = args.resume or cfg.get("checkpoint", {}).get("resume")
+        if resume_ckpt:
+            yaml_path = _find_yaml_for_ckpt(resume_ckpt)
+            if yaml_path:
+                model_params = _extract_model_params_from_yaml(yaml_path, model_name)
+                logger.info("Hydra: loaded model params from checkpoint YAML: %s", yaml_path)
+                if not model_params:
+                    raise ValueError(
+                        f"Cannot extract model params from '{yaml_path}'. Provide model.model_params explicitly in the Hydra config."
+                    )
+            else:
+                raise ValueError(
+                    "Model params not provided in config and resume checkpoint YAML not found; please provide model.params explicitly."
+                )
+        else:
+            raise ValueError(
+                "Model params not provided in config. Provide 'model.params' in your Hydra configuration or use a checkpoint with an accompanying YAML."
+            )
     # Create model & trainer
     model_cfg = cfg.get("model", {})
     model_name = model_cfg.get("name", "slat_mesh")
@@ -1196,9 +1364,27 @@ def train_from_config(cfg: dict):
             "chamfer_weight": 0.5,
             "mesh_reg_weight": 0.1,
         },
+        slat_generator_ckpt=slat_generator_ckpt,
+        slat_generator_params=slat_generator_params,
     )
 
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        ckpt_obj = _safe_load_checkpoint(args.resume)
+        if isinstance(ckpt_obj, dict) and "lora_state_dict" in ckpt_obj:
+            trainer.load_checkpoint(args.resume)
+        else:
+            try:
+                model_state = ckpt_obj
+                if isinstance(model_state, dict) and "state_dict" in model_state:
+                    state_dict = model_state["state_dict"]
+                else:
+                    state_dict = model_state
+                try:
+                    trainer.model.load_state_dict(state_dict, strict=False)
+                    logger.info("Loaded model weights from %s", args.resume)
+                except Exception as e:
+                    logger.warning("Failed to load model weights strictly: %s", e)
+            except Exception as e:
+                logger.warning("Failed to load resume checkpoint as model: %s", e)
 
     trainer.train(epochs=args.epochs, save_every=args.save_every, validate_every=1)
