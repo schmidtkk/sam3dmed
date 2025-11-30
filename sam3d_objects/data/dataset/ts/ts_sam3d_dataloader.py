@@ -203,8 +203,10 @@ class TS_SAM3D_Dataset(Dataset):
                 k = np.full_like(xv, z)
                 voxel_coords = np.stack([xv, yv, k, np.ones_like(xv)], axis=-1)
                 world_coords = (affine @ voxel_coords.reshape(-1, 4).T).T.reshape(H, W, 4)[..., :3]
+                # Replace masked positions (background) with zeros rather than NaN so
+                # that downstream embedding layers (e.g., Linear) don't produce NaN outputs.
                 xyz_masked = (
-                    np.where(mask_2d[..., None], world_coords, np.nan)
+                    np.where(mask_2d[..., None], world_coords, 0.0)
                     .astype(np.float32)
                     .transpose(2, 0, 1)
                 )
@@ -290,8 +292,9 @@ class TS_SAM3D_Dataset(Dataset):
             voxel_coords = np.stack([yv, k, xv, np.ones_like(xv)], axis=-1)
 
         world_coords = (affine @ voxel_coords.reshape(-1, 4).T).T.reshape(H, W, 4)[..., :3]
+        # Replace masked positions with zeros to avoid NaNs in downstream computations.
         xyz_masked = (
-            np.where(mask_2d[..., None], world_coords, np.nan).astype(np.float32).transpose(2, 0, 1)
+            np.where(mask_2d[..., None], world_coords, 0.0).astype(np.float32).transpose(2, 0, 1)
         )
         image_3ch = np.stack([image_2d, image_2d, image_2d], axis=0).astype(np.float32)
 
