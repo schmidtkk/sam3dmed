@@ -306,7 +306,28 @@ class TS_SAM3D_Dataset(Dataset):
             pointmap = torch.from_numpy(data["pointmap"]).float()
             affine = torch.from_numpy(data["affine"]).float() if "affine" in data else torch.eye(4)
             gt_sdf_path = data["gt_sdf_path"].item() if "gt_sdf_path" in data else None
-            gt_sdf = torch.from_numpy(np.load(gt_sdf_path)) if gt_sdf_path is not None else None
+            # Load per-volume SDF but return the 2D per-slice SDF corresponding to this sample
+            gt_sdf = None
+            if gt_sdf_path is not None:
+                try:
+                    gt_sdf_np = np.load(gt_sdf_path)
+                except Exception:
+                    gt_sdf_np = None
+                if gt_sdf_np is not None:
+                    # Slice index (axial by default) saved in cache during preprocessing
+                    slice_idx = int(data["slice_idx"]) if "slice_idx" in data else 0
+                    # If SDF has shape (C, D, H, W)
+                    if gt_sdf_np.ndim == 4:
+                        # select the slice and keep channel dimension: (C, H, W)
+                        gt_sdf_slice = gt_sdf_np[:, slice_idx, :, :]
+                    # If SDF has shape (D, H, W), convert to (1, H, W)
+                    elif gt_sdf_np.ndim == 3:
+                        gt_sdf_slice = gt_sdf_np[slice_idx, :, :][None, ...]
+                    else:
+                        # Unexpected shape - fallback to None
+                        gt_sdf_slice = None
+                    if gt_sdf_slice is not None:
+                        gt_sdf = torch.from_numpy(gt_sdf_slice.astype(np.float32))
             name = file_path.stem
 
             # Apply per-slice augmentations (before PreProcessor)
@@ -324,6 +345,7 @@ class TS_SAM3D_Dataset(Dataset):
                 "pointmap_scale": pp_return.get("pointmap_scale", None),
                 "pointmap_shift": pp_return.get("pointmap_shift", None),
                 "affine": affine,
+                # Return per-slice SDF (C, H, W) for compatibility with per-slice models
                 "mask_sdf": gt_sdf,
                 "name": name,
             }
