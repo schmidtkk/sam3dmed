@@ -393,6 +393,14 @@ def data_collate(batch):
     )
     segmentation = torch.stack([item["mask"] for item in batch])
     name = [item["name"] for item in batch]
+    
+    # Stack pointmaps (required for training)
+    pointmap = torch.stack(
+        [
+            item["pointmap"] if item["pointmap"] is not None else torch.zeros_like(item["image"])
+            for item in batch
+        ]
+    )
 
     affine_tensors = []
     for item in batch:
@@ -406,6 +414,7 @@ def data_collate(batch):
         "image": img.float(),
         "mask_sdf": mask_sdf.float(),
         "segmentation": segmentation,
+        "pointmap": pointmap.float(),
         "name": name,
         "affine": affine,
     }

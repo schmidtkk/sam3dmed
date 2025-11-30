@@ -451,10 +451,10 @@ class MedicalTrainer:
         pred_faces = outputs.get("faces")
         pred_occupancy = outputs.get("occupancy")
 
-        # Extract ground truth
-        gt_sdf = batch.get("sdf")
+        # Extract ground truth - handle both 'sdf' and 'mask_sdf' keys
+        gt_sdf = batch.get("sdf") or batch.get("mask_sdf")
         gt_vertices = batch.get("vertices")
-        gt_occupancy = batch.get("mask")
+        gt_occupancy = batch.get("mask") or batch.get("segmentation")
 
         return self.losses(
             pred_sdf=pred_sdf,
@@ -543,10 +543,15 @@ def create_dummy_model():
 
         def forward(self, image, pointmap):
             # Dummy forward
-            x = self.embed(pointmap)
+            # pointmap comes in as (B, 3, H, W) - convert to (B, H, W, 3) for embed layer
+            if pointmap.ndim == 4 and pointmap.shape[1] == 3:
+                pointmap = pointmap.permute(0, 2, 3, 1).contiguous()
+            x = self.embed(pointmap)  # (B, H, W, channels)
             x = self.to_out(self.to_qkv(x)[..., : x.shape[-1]])
             x = self.out_layer(x)
-            sdf = self.sdf_head(x)
+            sdf = self.sdf_head(x)  # (B, H, W, 1)
+            # Rearrange to (B, 1, H, W) for compatibility with SDF losses
+            sdf = sdf.permute(0, 3, 1, 2).contiguous()
             return {
                 "sdf": sdf,
                 "vertices": None,

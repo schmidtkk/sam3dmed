@@ -10,4 +10,4 @@ outputs/
 results/
 
 # NFS temp files
-.nfs*
+.nfs*nnUNet_preprocessed/
