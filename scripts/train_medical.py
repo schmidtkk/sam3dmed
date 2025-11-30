@@ -82,6 +82,27 @@ class MedicalTrainingLosses(nn.Module):
             gt_sdf: Ground truth SDF values
             mask: Optional mask for valid regions
         """
+        # If pred and gt sizes mismatch, crop to the minimum overlapping region to avoid
+        # broadcasting/shape mismatch errors. This is helpful for datasets with variable
+        # slice sizes during development sanity runs.
+        if pred_sdf.shape != gt_sdf.shape:
+            # Align dimensions: support (B, C, H, W) and (B, C, D, H, W)
+            pred_shape = pred_sdf.shape
+            gt_shape = gt_sdf.shape
+            # Work with last two dims (H, W) primarily; for volumetric GT, index the last two
+            h_pred, w_pred = pred_shape[-2], pred_shape[-1]
+            h_gt, w_gt = gt_shape[-2], gt_shape[-1]
+            h_min, w_min = min(h_pred, h_gt), min(w_pred, w_gt)
+            # Crop both tensors to overlapping region
+            if pred_sdf.ndim == 4:
+                pred_sdf = pred_sdf[..., :h_min, :w_min]
+            elif pred_sdf.ndim == 5:
+                pred_sdf = pred_sdf[..., :h_min, :w_min]
+            if gt_sdf.ndim == 4:
+                gt_sdf = gt_sdf[..., :h_min, :w_min]
+            elif gt_sdf.ndim == 5:
+                gt_sdf = gt_sdf[..., :h_min, :w_min]
+
         if self.sdf_loss_type == "l1":
             loss = F.l1_loss(pred_sdf, gt_sdf, reduction="none")
         else:
