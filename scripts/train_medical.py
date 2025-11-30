@@ -603,6 +603,9 @@ def create_dummy_model():
             # pointmap comes in as (B, 3, H, W) - convert to (B, H, W, 3) for embed layer
             if pointmap.ndim == 4 and pointmap.shape[1] == 3:
                 pointmap = pointmap.permute(0, 2, 3, 1).contiguous()
+            # Replace NaNs/inf in pointmap to avoid NaN propagation in Linear layers
+            if torch.isfinite(pointmap).all() is False:
+                pointmap = torch.nan_to_num(pointmap, nan=0.0, posinf=0.0, neginf=0.0)
             x = self.embed(pointmap)  # (B, H, W, channels)
             x = self.to_out(self.to_qkv(x)[..., : x.shape[-1]])
             x = self.out_layer(x)
