@@ -316,6 +316,16 @@ class TS_SAM3D_Dataset(Dataset):
                 if gt_sdf_np is not None:
                     # Slice index (axial by default) saved in cache during preprocessing
                     slice_idx = int(data["slice_idx"]) if "slice_idx" in data else 0
+                    # Guard against mismatched axis orders or off-by-one indices by clamping
+                    # the slice index to the valid range for the volume's depth.
+                    if gt_sdf_np.ndim == 4:
+                        max_d = gt_sdf_np.shape[1]
+                    elif gt_sdf_np.ndim == 3:
+                        max_d = gt_sdf_np.shape[0]
+                    else:
+                        max_d = 0
+                    if max_d > 0:
+                        slice_idx = min(slice_idx, max_d - 1)
                     # If SDF has shape (C, D, H, W)
                     if gt_sdf_np.ndim == 4:
                         # select the slice and keep channel dimension: (C, H, W)
