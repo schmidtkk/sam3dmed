@@ -4,19 +4,52 @@ Purpose: Fine-tune SAM3D-Object for medical imaging (e.g., MR/CT/Ultrasound), en
 
 ---
 
+## CRITICAL: Two-Stage Architecture
+
+**The SAM3D framework uses a two-stage pipeline. Fine-tuning MUST include both stages for end-to-end medical reconstruction.**
+
+### Stage 1: Sparse Structure Generation (`ss_generator` + `ss_decoder`)
+- **Purpose**: Predicts WHERE voxels should be (coarse 3D occupancy)
+- `sample_sparse_structure()` → generates 3D voxel coordinates
+- Uses `ss_generator` (SparseStructureFlowModel) to predict shape latent from image
+- Uses `ss_decoder` to decode latent → 3D binary occupancy → coordinates
+- **Output**: Sparse 3D coordinates indicating occupied voxels
+
+### Stage 2: Structured Latent Generation & Decoding (`slat_generator` + `slat_decoder_mesh`)
+- **Purpose**: Predicts WHAT the detailed shape is at each voxel
+- `sample_slat()` → generates structured latent features at each voxel
+- Uses `slat_generator` (SLatFlowModel) conditioned on coordinates from Stage 1
+- Uses `slat_decoder_mesh` to decode latent → mesh (SDF + marching cubes)
+- **Output**: High-resolution mesh with accurate surfaces
+
+### Training Strategy
+1. **Option A (Recommended for medical)**: Train Stage 1 and Stage 2 together
+   - Both `ss_generator` and `slat_generator` receive LoRA adapters
+   - End-to-end gradient flow (or staged training with frozen components)
+   
+2. **Option B**: Stage-wise training
+   - First train Stage 1 (`ss_generator`) with occupancy/voxel supervision
+   - Then freeze Stage 1, train Stage 2 (`slat_generator` + `slat_decoder_mesh`) with mesh/SDF supervision
+
+---
+
 ## Overview & Scope
 - Task: Given a 2D user click (single slice), produce a 3D reconstruction of the organ (mesh / gaussian / occupancy). Use LoRA for parameter-efficient fine-tuning.
-- Minimal approach: fine-tune the structured latent (slat) generator/decoder, conditioning on single-slice pointmap or segmentation mask. Prioritize mesh-based decoding (SLatMeshDecoder) for higher fidelity surface reconstructions where clinically relevant. For medical tasks where object placement in a scene is irrelevant, prefer shape-only training without pose conditioning (see `include_pose` and `pose_decoder_name` settings below). 
- - Minimal approach: fine-tune the structured latent (slat) generator/decoder, conditioning on single-slice pointmap or segmentation mask. Mesh-only initial training: fine-tune `SLatMeshDecoder` with LoRA adapters on attention/FFN modules and supervise with SDF and mesh losses. Gaussian representations are optional later experiments only. For medical tasks where object placement in a scene is irrelevant, prefer shape-only training without pose conditioning (see `include_pose` and `pose_decoder_name` settings below).
+- **Two-stage approach**: Fine-tune both `ss_generator` (Stage 1) and `slat_generator`/`slat_decoder` (Stage 2). Prioritize mesh-based decoding (SLatMeshDecoder) for higher fidelity surface reconstructions where clinically relevant. For medical tasks where object placement in a scene is irrelevant, prefer shape-only training without pose conditioning (see `include_pose` and `pose_decoder_name` settings below).
 
 ---
 
 ## Short Plan (High-level steps)
-1. Prepare medical dataset → one sample per 2D slice (random axis sampling among x,y,z) + 2D click / mask + 3D GT shapes/voxels/meshes
- 2. Implement dataset class & PreProcessor config to return keys expected by pipeline (`image`, `mask` or `pointmap`, `gt_3d`). If your pipeline configuration disables pose tokens (recommended), then `pose_target` is not required. If the pipeline expects pose tokens, provide a default `pose_target` (see Pose handling).
-3. Integrate LoRA adapters into model (Transformer Q/K/V/out and FeedForward) for low-cost fine-tuning
-4. Fine-tune `slat_generator` (and optionally `ss_generator`), freeze base weights, only train LoRA and decoder heads
-5. Validate on held-out volumes: 2D mask accuracy, Chamfer/IoU on 3D outputs
+1. Prepare medical dataset → one sample per 2D slice (random axis sampling among x,y,z) + 2D click / mask + 3D GT shapes/voxels/meshes + occupancy grid for Stage 1
+2. Implement dataset class & PreProcessor config to return keys expected by pipeline:
+   - Stage 1 keys: `image`, `mask`, `gt_occupancy` (3D binary grid for `ss_decoder` supervision)
+   - Stage 2 keys: `image`, `mask`, `pointmap`, `gt_3d` (mesh/SDF for `slat_decoder` supervision)
+   - If pipeline disables pose tokens (recommended), `pose_target` is not required
+3. Integrate LoRA adapters into BOTH stages:
+   - Stage 1: `ss_generator` Transformer Q/K/V/out and FeedForward layers
+   - Stage 2: `slat_generator` and optionally `slat_decoder_mesh` layers
+4. Fine-tune both stages, freeze base weights, only train LoRA and decoder heads
+5. Validate on held-out volumes: 2D mask accuracy, 3D occupancy IoU (Stage 1), Chamfer/mesh IoU (Stage 2)
 
 ---
 

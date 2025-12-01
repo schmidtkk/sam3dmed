@@ -117,9 +117,30 @@ class TS_SAM3D_Dataset(Dataset):
             self.file_names = []  # no file names, we will sample on-the-fly
 
     def _filter_by_occupancy(self, file_paths: list[Path]) -> list[Path]:
-        """Filter cached slice files by minimum foreground occupancy."""
+        """Filter cached slice files by minimum foreground occupancy.
+        
+        Uses a cache file to avoid re-scanning all npz files on every run.
+        """
+        # Check for cached filter results
+        cache_file = self.slice_cache_dir / f"_occupancy_filter_{self.occupancy_threshold:.4f}.txt"
+        if cache_file.exists():
+            try:
+                with open(cache_file, "r") as f:
+                    cached_files = [self.slice_cache_dir / line.strip() for line in f if line.strip()]
+                # Verify files still exist
+                existing = [fp for fp in cached_files if fp.exists()]
+                if len(existing) == len(cached_files):
+                    print(f"[Dataset] Loaded {len(existing)} filtered slices from cache")
+                    return existing
+            except Exception:
+                pass
+        
+        # Filter and cache results
+        print(f"[Dataset] Filtering {len(file_paths)} slices by occupancy >= {self.occupancy_threshold}...")
         filtered = []
-        for fp in file_paths:
+        for i, fp in enumerate(file_paths):
+            if (i + 1) % 500 == 0:
+                print(f"[Dataset] Filtering progress: {i+1}/{len(file_paths)}")
             try:
                 data = np.load(str(fp), allow_pickle=True)
                 mask = data["mask"]
@@ -128,6 +149,16 @@ class TS_SAM3D_Dataset(Dataset):
                     filtered.append(fp)
             except Exception:
                 continue
+        
+        # Save cache
+        try:
+            with open(cache_file, "w") as f:
+                for fp in filtered:
+                    f.write(fp.name + "\n")
+            print(f"[Dataset] Cached {len(filtered)} filtered slices")
+        except Exception as e:
+            print(f"[Dataset] Warning: could not cache filter results: {e}")
+        
         return filtered
 
     def _gather_cases(self):

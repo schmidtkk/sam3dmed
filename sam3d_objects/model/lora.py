@@ -89,10 +89,12 @@ class LoRALinear(nn.Module):
             # Original linear pass on features
             result = self.original_linear(x)  # Returns SparseTensor
             
-            # LoRA path on features
+            # LoRA path on features - cast weights to input dtype for mixed precision
             lora_x = self.lora_dropout(feats)
-            lora_out = lora_x @ self.lora_A.T
-            lora_out = lora_out @ self.lora_B.T
+            lora_A = self.lora_A.to(lora_x.dtype)
+            lora_B = self.lora_B.to(lora_x.dtype)
+            lora_out = lora_x @ lora_A.T
+            lora_out = lora_out @ lora_B.T
             lora_out = lora_out * self.scaling
             
             # Add LoRA output to result features and return new SparseTensor
@@ -102,9 +104,12 @@ class LoRALinear(nn.Module):
         result = self.original_linear(x)
 
         # LoRA path: x -> dropout -> A -> B -> scale
+        # Cast weights to input dtype for mixed precision compatibility
         lora_x = self.lora_dropout(x)
-        lora_out = lora_x @ self.lora_A.T  # (*, in_features) @ (in_features, rank) -> (*, rank)
-        lora_out = lora_out @ self.lora_B.T  # (*, rank) @ (rank, out_features) -> (*, out_features)
+        lora_A = self.lora_A.to(lora_x.dtype)
+        lora_B = self.lora_B.to(lora_x.dtype)
+        lora_out = lora_x @ lora_A.T  # (*, in_features) @ (in_features, rank) -> (*, rank)
+        lora_out = lora_out @ lora_B.T  # (*, rank) @ (rank, out_features) -> (*, out_features)
         lora_out = lora_out * self.scaling
 
         return result + lora_out

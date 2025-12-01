@@ -4,6 +4,17 @@
 # Example: override preprocess_crop_size (use JSON-like list syntax):
 #   python scripts/train_medical_hydra.py data.preprocess_crop_size=[256,256]
 
+# =============================================================================
+# CRITICAL: SAM3D uses a TWO-STAGE PIPELINE
+# =============================================================================
+# Stage 1: ss_generator → predicts WHERE voxels are (sparse structure)
+# Stage 2: slat_generator + slat_decoder_mesh → predicts WHAT the shape is
+#
+# For end-to-end medical reconstruction, BOTH stages must be fine-tuned.
+# Current implementation trains Stage 2 (slat_decoder_mesh) with optional
+# slat_generator for producing latents.
+# =============================================================================
+
 defaults:
   - _self_
 
@@ -30,6 +41,8 @@ training:
   grad_clip_norm: 1.0
   num_workers: 4
   mixed_precision: false
+  # Training mode: 'stage2_only' (current) or 'two_stage' (future)
+  mode: stage2_only
   # Scheduler configuration
   scheduler:
     name: onecycle
@@ -60,7 +73,38 @@ checkpoint:
   save_every: 5
   validate_every: 1
 
+# =============================================================================
+# Stage 1: Sparse Structure Generator (ss_generator)
+# =============================================================================
+# Predicts 3D voxel occupancy from 2D input
+stage1:
+  enabled: false
+  # Checkpoint for pretrained ss_generator
+  ss_generator_ckpt: ${oc.env:SAM3D_SS_GENERATOR_CKPT,./checkpoints/hf/ss_generator.ckpt}
+  ss_generator_config: ${oc.env:SAM3D_SS_GENERATOR_CONFIG,./checkpoints/hf/ss_generator.yaml}
+  # Checkpoint for pretrained ss_decoder
+  ss_decoder_ckpt: ${oc.env:SAM3D_SS_DECODER_CKPT,./checkpoints/hf/ss_decoder.ckpt}
+  # Whether to fine-tune ss_generator with LoRA
+  finetune: true
+  # Loss weights for Stage 1
+  loss:
+    occupancy_weight: 1.0
+
+# =============================================================================
+# Stage 2: Structured Latent Generator + Mesh Decoder
+# =============================================================================
+# slat_generator: produces structured latent features at each voxel
+# slat_decoder_mesh: decodes latent to mesh via SDF + marching cubes
+stage2:
+  enabled: true
+  # Checkpoint for pretrained slat_generator (for producing training latents)
+  slat_generator_ckpt: ${oc.env:SAM3D_SLAT_GENERATOR_CKPT,./checkpoints/hf/slat_generator.ckpt}
+  slat_generator_config: ${oc.env:SAM3D_SLAT_GENERATOR_CONFIG,./checkpoints/hf/slat_generator.yaml}
+  # Whether to fine-tune slat_generator with LoRA (in addition to decoder)
+  finetune_generator: false
+
 # Model configuration - aligned with pretrained slat_decoder_mesh.yaml
+# This is the primary model being trained (slat_decoder_mesh)
 model:
   name: slat_mesh
   params:

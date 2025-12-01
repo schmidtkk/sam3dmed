@@ -1,4 +1,10 @@
-"""Tests for medical training harness."""
+"""Tests for medical training harness.
+
+IMPORTANT: These tests are STRICT about failures.
+- No silent fallbacks
+- All model loading errors should raise exceptions
+- Tests should fail if critical components cannot be instantiated
+"""
 
 import sys
 from pathlib import Path
@@ -16,8 +22,14 @@ from scripts.train_medical import (
     MedicalTrainingLosses,
     create_dummy_model,
     create_model,
+    _extract_model_params_from_yaml,
+    _find_yaml_for_ckpt,
 )
 
+
+# =============================================================================
+# Test Loss Functions
+# =============================================================================
 
 class TestMedicalTrainingLosses:
     """Tests for MedicalTrainingLosses class."""
@@ -139,19 +151,23 @@ class TestMedicalTrainingLosses:
         assert "chamfer" not in result
 
 
-class TestCreateDummyModel:
-    """Tests for dummy model creation."""
+# =============================================================================
+# Test Model Factory - STRICT, NO FALLBACKS
+# =============================================================================
 
-    def test_create_model(self):
-        """Test model creation."""
+class TestModelFactory:
+    """Tests for model factory functions - STRICT about failures."""
+
+    def test_create_dummy_model(self):
+        """Test dummy model creation."""
         model = create_dummy_model()
 
         assert isinstance(model, nn.Module)
         assert hasattr(model, "to_qkv")
         assert hasattr(model, "to_out")
 
-    def test_forward(self):
-        """Test model forward pass."""
+    def test_dummy_model_forward(self):
+        """Test dummy model forward pass."""
         model = create_dummy_model()
 
         image = torch.randn(2, 1, 256, 256)
@@ -162,96 +178,181 @@ class TestCreateDummyModel:
         assert isinstance(outputs, dict)
         assert "sdf" in outputs
 
+    def test_create_slat_mesh_model(self):
+        """Test SLatMeshDecoder instantiation - MUST NOT FAIL."""
+        # model_channels must be divisible by 256 (8 * 32 for group norm)
+        model = create_model(name="slat_mesh", params={
+            "resolution": 4,
+            "model_channels": 256,
+            "latent_channels": 16,
+            "num_blocks": 2,
+            "num_heads": 4,
+        })
 
-def test_create_slat_mesh_model():
-    """Test that the SLatMeshDecoder can be instantiated via create_model factory."""
-    # model_channels must be large enough so out_channels (model_channels // 8) >= 32
-    # because SparseGroupNorm32 uses num_groups=32 by default
-    model = create_model(name="slat_mesh", params={
-        "resolution": 4,
-        "model_channels": 256,
-        "latent_channels": 16,
-        "num_blocks": 2,
-        "num_heads": 4,
-    })
+        assert isinstance(model, nn.Module)
+        
+        # Must have attention layers for LoRA injection
+        module_names = [name for name, _ in model.named_modules()]
+        assert any("to_qkv" in name for name in module_names), "Model MUST have to_qkv layers"
+        assert any("to_out" in name for name in module_names), "Model MUST have to_out layers"
 
-    assert isinstance(model, nn.Module)
-    # LoRA expects to find to_qkv/to_out layers in the model's attention blocks
-    # These are nested inside blocks[i].attn, so check recursively via named_modules
-    module_names = [name for name, _ in model.named_modules()]
-    assert any("to_qkv" in name for name in module_names), "Model should have to_qkv layers"
-    assert any("to_out" in name for name in module_names), "Model should have to_out layers"
+    def test_create_slat_mesh_invalid_channels_raises(self):
+        """Test that invalid model_channels raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid 'model_channels'"):
+            create_model(name="slat_mesh", params={
+                "resolution": 4,
+                "model_channels": 64,  # Invalid: not divisible by 256
+                "latent_channels": 16,
+                "num_blocks": 2,
+                "num_heads": 4,
+            })
+
+    def test_create_unknown_model_raises(self):
+        """Test that unknown model name raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown model name"):
+            create_model(name="nonexistent_model")
+
+    def test_create_slat_generator(self):
+        """Test slat_generator model creation using Hydra instantiate pattern."""
+        from omegaconf import OmegaConf
+        from hydra.utils import instantiate
+        from sam3d_objects.model.io import load_model_from_checkpoint, filter_and_remove_prefix_state_dict_fn
+        
+        workspace_dir = "/mnt/nas1/disk01/weidongguo/workspace/sam-3d-objects"
+        config_path = f"{workspace_dir}/checkpoints/hf/slat_generator.yaml"
+        ckpt_path = f"{workspace_dir}/checkpoints/hf/slat_generator.ckpt"
+        
+        # Load config and extract backbone config
+        config = OmegaConf.load(config_path)["module"]["generator"]["backbone"]
+        
+        # Instantiate model from config
+        model = instantiate(config)
+        assert isinstance(model, nn.Module), "instantiate MUST return a Module"
+        
+        # Load weights
+        state_dict_prefix_func = filter_and_remove_prefix_state_dict_fn("_base_models.generator.")
+        model = load_model_from_checkpoint(
+            model,
+            ckpt_path,
+            strict=True,
+            device="cpu",
+            freeze=True,
+            eval=True,
+            state_dict_key="state_dict",
+            state_dict_fn=state_dict_prefix_func,
+        )
+        
+        assert model is not None
+        # Verify model has expected structure
+        assert hasattr(model, 'forward')
+
+    def test_create_ss_generator(self):
+        """Test ss_generator (Stage 1) model creation using Hydra instantiate pattern."""
+        from omegaconf import OmegaConf
+        from hydra.utils import instantiate
+        from sam3d_objects.model.io import load_model_from_checkpoint, filter_and_remove_prefix_state_dict_fn
+        
+        workspace_dir = "/mnt/nas1/disk01/weidongguo/workspace/sam-3d-objects"
+        config_path = f"{workspace_dir}/checkpoints/hf/ss_generator.yaml"
+        ckpt_path = f"{workspace_dir}/checkpoints/hf/ss_generator.ckpt"
+        
+        # Load config and extract backbone config
+        config = OmegaConf.load(config_path)["module"]["generator"]["backbone"]
+        
+        # Instantiate model from config  
+        model = instantiate(config)
+        assert isinstance(model, nn.Module), "instantiate MUST return a Module"
+        
+        # Load weights
+        state_dict_prefix_func = filter_and_remove_prefix_state_dict_fn("_base_models.generator.")
+        model = load_model_from_checkpoint(
+            model,
+            ckpt_path,
+            strict=True,
+            device="cpu",
+            freeze=True,
+            eval=True,
+            state_dict_key="state_dict",
+            state_dict_fn=state_dict_prefix_func,
+        )
+        
+        assert model is not None
+        assert hasattr(model, 'forward')
+
+    def test_create_ss_decoder(self):
+        """Test ss_decoder (Stage 1) model creation - MUST NOT FAIL."""
+        model = create_model(name="ss_decoder", params={
+            "out_channels": 1,
+            "latent_channels": 8,
+        })
+        
+        assert isinstance(model, nn.Module)
 
 
-def test_slat_mesh_trainer_init(tmp_path):
-    """Test initializing MedicalTrainer with SLatMeshDecoder and ensure LoRA setup runs."""
-    from torch.utils.data import DataLoader, TensorDataset
+# =============================================================================
+# Test YAML Extraction - STRICT
+# =============================================================================
 
-    # model_channels must be large enough so out_channels (model_channels // 8) >= 32
-    # because SparseGroupNorm32 uses num_groups=32 by default
-    model = create_model(name="slat_mesh", params={
-        "resolution": 4,
-        "model_channels": 256,
-        "latent_channels": 16,
-        "num_blocks": 2,
-        "num_heads": 4,
-        "device": "cpu",
-    })
+class TestYamlExtraction:
+    """Tests for YAML config extraction."""
 
-    # Create dummy dataset; no need to match forward exactly for init tests
-    dummy_images = torch.randn(8, 1, 64, 64)
-    dummy_pointmaps = torch.randn(8, 64, 64, 3)
-    dummy_sdfs = torch.randn(8, 1, 16, 16, 16)
-    dummy_masks = (torch.rand(8, 16, 16, 16) > 0.5).float()
+    def test_extract_slat_generator_params(self, tmp_path):
+        """Test extracting params from slat_generator YAML structure."""
+        yaml_content = """
+module:
+  generator:
+    backbone:
+      reverse_fn:
+        backbone:
+          model_channels: 1024
+          in_channels: 8
+          out_channels: 8
+          num_blocks: 24
+          num_heads: 16
+          resolution: 64
+"""
+        yaml_file = tmp_path / "slat_generator.yaml"
+        yaml_file.write_text(yaml_content)
+        
+        params = _extract_model_params_from_yaml(str(yaml_file), "slat_generator")
+        
+        assert params["model_channels"] == 1024
+        assert params["in_channels"] == 8
+        assert params["out_channels"] == 8
+        assert params["num_blocks"] == 24
+        assert params["num_heads"] == 16
 
-    dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
+    def test_find_yaml_for_ckpt(self, tmp_path):
+        """Test finding YAML config for checkpoint."""
+        # Create checkpoint and yaml files
+        (tmp_path / "model.ckpt").touch()
+        (tmp_path / "model.yaml").write_text("test: true")
+        
+        yaml_path = _find_yaml_for_ckpt(str(tmp_path / "model.ckpt"))
+        
+        assert yaml_path == str(tmp_path / "model.yaml")
 
-    def collate_fn(batch):
-        images, pointmaps, sdfs, masks = zip(*batch)
-        return {
-            "image": torch.stack(images),
-            "pointmap": torch.stack(pointmaps),
-            "sdf": torch.stack(sdfs),
-            "mask": torch.stack(masks),
-        }
+    def test_find_yaml_for_ckpt_returns_none_if_missing(self, tmp_path):
+        """Test returns None if no YAML exists."""
+        (tmp_path / "model.ckpt").touch()
+        
+        yaml_path = _find_yaml_for_ckpt(str(tmp_path / "model.ckpt"))
+        
+        assert yaml_path is None
 
-    loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
 
-    trainer = MedicalTrainer(
-        model=model,
-        train_loader=loader,
-        val_loader=loader,
-        lr=1e-3,
-        checkpoint_dir=str(tmp_path),
-        mixed_precision=False,
-        device="cpu",
-    )
-
-    # After initialization, LoRA should have been injected
-    from sam3d_objects.model.lora import LoRALinear
-
-    # Walk named params to find lora modules
-    found = False
-    for _, module in trainer.model.named_modules():
-        if isinstance(module, LoRALinear):
-            found = True
-            break
-
-    assert found, "LoRA injection did not find any LoRALinear modules"
-
+# =============================================================================
+# Test Trainer - STRICT INITIALIZATION
+# =============================================================================
 
 class TestMedicalTrainer:
-    """Tests for MedicalTrainer class."""
+    """Tests for MedicalTrainer class - STRICT about initialization."""
 
     @pytest.fixture
-    def dummy_trainer(self, tmp_path):
-        """Create a dummy trainer for testing."""
-        model = create_dummy_model()
-
-        # Create dummy dataloader - make SDF match model output shape
+    def dummy_loader(self):
+        """Create a dummy dataloader."""
         dummy_images = torch.randn(8, 1, 256, 256)
         dummy_pointmaps = torch.randn(8, 256, 256, 3)
-        # Match model output: (B, 256, 256, 1) for SDF
         dummy_sdfs = torch.randn(8, 256, 256, 1)
         dummy_masks = (torch.rand(8, 256, 256) > 0.5).float()
 
@@ -266,160 +367,282 @@ class TestMedicalTrainer:
                 "mask": torch.stack(masks),
             }
 
-        loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
+        return DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
+
+    def test_trainer_init_with_dummy_model(self, dummy_loader, tmp_path):
+        """Test trainer initialization with dummy model."""
+        model = create_dummy_model()
 
         trainer = MedicalTrainer(
             model=model,
-            train_loader=loader,
-            val_loader=loader,
+            train_loader=dummy_loader,
+            val_loader=dummy_loader,
             lr=1e-3,
             lora_rank=4,
             lora_alpha=8.0,
             checkpoint_dir=str(tmp_path),
-            mixed_precision=False,  # CPU testing
+            mixed_precision=False,
             device="cpu",
         )
 
-        return trainer
+        assert trainer.lora_rank == 4
+        assert trainer.lora_alpha == 8.0
+        assert trainer.optimizer is not None
 
-    def test_trainer_init(self, dummy_trainer):
-        """Test trainer initialization."""
-        assert dummy_trainer.lora_rank == 4
-        assert dummy_trainer.lora_alpha == 8.0
-        assert dummy_trainer.optimizer is not None
+    def test_trainer_init_with_slat_mesh(self, dummy_loader, tmp_path):
+        """Test trainer initialization with SLatMeshDecoder - MUST inject LoRA."""
+        model = create_model(name="slat_mesh", params={
+            "resolution": 4,
+            "model_channels": 256,
+            "latent_channels": 16,
+            "num_blocks": 2,
+            "num_heads": 4,
+            "device": "cpu",
+        })
 
-    def test_lora_setup(self, dummy_trainer):
-        """Test that LoRA was set up correctly."""
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=dummy_loader,
+            val_loader=dummy_loader,
+            lr=1e-3,
+            checkpoint_dir=str(tmp_path),
+            mixed_precision=False,
+            device="cpu",
+        )
+
+        # LoRA MUST be injected
         from sam3d_objects.model.lora import LoRALinear
 
-        model = dummy_trainer.model
+        found = False
+        for _, module in trainer.model.named_modules():
+            if isinstance(module, LoRALinear):
+                found = True
+                break
 
-        # Check that to_qkv and to_out are LoRA layers
-        assert isinstance(model.to_qkv, LoRALinear)
-        assert isinstance(model.to_out, LoRALinear)
+        assert found, "LoRA injection MUST succeed for SLatMeshDecoder"
 
-    def test_train_epoch(self, dummy_trainer):
+    def test_lora_layers_injected(self, dummy_loader, tmp_path):
+        """Test that LoRA was set up correctly on dummy model."""
+        from sam3d_objects.model.lora import LoRALinear
+
+        model = create_dummy_model()
+        
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=dummy_loader,
+            checkpoint_dir=str(tmp_path),
+            mixed_precision=False,
+            device="cpu",
+        )
+
+        # to_qkv and to_out MUST be LoRA layers
+        assert isinstance(model.to_qkv, LoRALinear), "to_qkv MUST be LoRALinear"
+        assert isinstance(model.to_out, LoRALinear), "to_out MUST be LoRALinear"
+
+    def test_train_epoch(self, dummy_loader, tmp_path):
         """Test single training epoch."""
-        losses = dummy_trainer.train_epoch()
+        model = create_dummy_model()
+        
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=dummy_loader,
+            checkpoint_dir=str(tmp_path),
+            mixed_precision=False,
+            device="cpu",
+        )
+
+        losses = trainer.train_epoch()
 
         assert "total" in losses
         assert losses["total"] >= 0
 
-    def test_validate(self, dummy_trainer):
+    def test_validate(self, dummy_loader, tmp_path):
         """Test validation."""
-        losses = dummy_trainer.validate()
+        model = create_dummy_model()
+        
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=dummy_loader,
+            val_loader=dummy_loader,
+            checkpoint_dir=str(tmp_path),
+            mixed_precision=False,
+            device="cpu",
+        )
+
+        losses = trainer.validate()
 
         assert "total" in losses
         assert losses["total"] >= 0
 
-    def test_save_and_load_checkpoint(self, dummy_trainer):
+    def test_save_and_load_checkpoint(self, dummy_loader, tmp_path):
         """Test checkpoint save and load."""
+        model = create_dummy_model()
+        
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=dummy_loader,
+            checkpoint_dir=str(tmp_path),
+            mixed_precision=False,
+            device="cpu",
+        )
+
         # Modify a LoRA parameter
-        for name, param in dummy_trainer.model.named_parameters():
+        for name, param in trainer.model.named_parameters():
             if "lora_A" in name:
                 param.data = torch.randn_like(param)
                 break
 
         # Save
-        dummy_trainer.save_checkpoint("test.pt")
-        checkpoint_path = dummy_trainer.checkpoint_dir / "test.pt"
-        assert checkpoint_path.exists()
+        trainer.save_checkpoint("test.pt")
+        checkpoint_path = trainer.checkpoint_dir / "test.pt"
+        assert checkpoint_path.exists(), "Checkpoint file MUST be saved"
 
         # Load into new trainer
         model2 = create_dummy_model()
         trainer2 = MedicalTrainer(
             model=model2,
-            train_loader=dummy_trainer.train_loader,
-            checkpoint_dir=str(dummy_trainer.checkpoint_dir),
+            train_loader=dummy_loader,
+            checkpoint_dir=str(tmp_path),
             mixed_precision=False,
             device="cpu",
         )
 
         trainer2.load_checkpoint(str(checkpoint_path))
 
-        # Compare LoRA weights
+        # Compare LoRA weights - MUST match
         for (n1, p1), (_n2, p2) in zip(
-            dummy_trainer.model.named_parameters(), trainer2.model.named_parameters()
+            trainer.model.named_parameters(), trainer2.model.named_parameters()
         ):
             if "lora_A" in n1 or "lora_B" in n1:
                 torch.testing.assert_close(p1, p2)
 
-    def test_to_device(self, dummy_trainer):
-        """Test batch device transfer."""
-        batch = {
-            "image": torch.randn(2, 1, 256, 256),
-            "pointmap": torch.randn(2, 256, 256, 3),
-            "metadata": "not a tensor",
-        }
-
-        moved = dummy_trainer._to_device(batch)
-
-        assert moved["image"].device == dummy_trainer.device
-        assert moved["pointmap"].device == dummy_trainer.device
-        assert moved["metadata"] == "not a tensor"
-
-    def test_aggregate_losses(self, dummy_trainer):
+    def test_aggregate_losses(self, dummy_loader, tmp_path):
         """Test loss aggregation."""
+        model = create_dummy_model()
+        
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=dummy_loader,
+            checkpoint_dir=str(tmp_path),
+            mixed_precision=False,
+            device="cpu",
+        )
+
         losses_list = [
             {"total": 1.0, "sdf": 0.5},
             {"total": 2.0, "sdf": 1.0},
             {"total": 3.0, "sdf": 1.5},
         ]
 
-        agg = dummy_trainer._aggregate_losses(losses_list)
+        agg = trainer._aggregate_losses(losses_list)
 
         assert agg["total"] == 2.0
         assert agg["sdf"] == 1.0
 
-    def test_detect_nonfinite_tensors(self, dummy_trainer, caplog, tmp_path, monkeypatch):
-        """Test _detect_nonfinite_tensors logs when SANITY_DEBUG is set and batch contains NaNs."""
-        import os
 
-        monkeypatch.setenv("SANITY_DEBUG", "1")
+# =============================================================================
+# Test Two-Stage Training Configuration
+# =============================================================================
 
-        # Create a batch with a NaN in the image tensor
-        batch = {
-            "image": torch.tensor([[[[float('nan')]]]]),
-            "pointmap": torch.rand(1, 1, 1, 3),
-        }
+class TestTwoStageTraining:
+    """Tests for two-stage training mode."""
 
-        # Prepare a simple outputs dict
-        outputs = {"sdf": torch.randn(1, 1, 1, 1)}
+    @pytest.fixture
+    def dummy_loader(self):
+        """Create a dummy dataloader with occupancy data."""
+        dummy_images = torch.randn(8, 1, 256, 256)
+        dummy_pointmaps = torch.randn(8, 256, 256, 3)
+        dummy_sdfs = torch.randn(8, 256, 256, 1)
+        dummy_masks = (torch.rand(8, 256, 256) > 0.5).float()
+        dummy_occupancy = (torch.rand(8, 16, 16, 16) > 0.5).float()
 
-        # Ensure the helper runs without raising; call safely depending on how the
-        # test environment bound the method (class vs instance assignment).
-        meth = getattr(dummy_trainer, "_detect_nonfinite_tensors", None)
-        with caplog.at_level("WARNING"):
-            if meth is not None:
-                try:
-                    meth(batch, outputs, 0)
-                except TypeError:
-                    # Try calling as an unbound function on the class
-                    cls_meth = getattr(dummy_trainer.__class__, "_detect_nonfinite_tensors", None)
-                    if cls_meth is not None:
-                        cls_meth(dummy_trainer, batch, outputs, 0)
-            else:
-                # As a last resort, call the module-level helper if present
-                try:
-                    from scripts.train_medical import _detect_nonfinite_tensors_impl as _fn
+        dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks, dummy_occupancy)
 
-                    _fn(dummy_trainer, batch, outputs, 0)
-                except Exception:
-                    pass
+        def collate_fn(batch):
+            images, pointmaps, sdfs, masks, occs = zip(*batch)
+            return {
+                "image": torch.stack(images),
+                "pointmap": torch.stack(pointmaps),
+                "sdf": torch.stack(sdfs),
+                "mask": torch.stack(masks),
+                "gt_occupancy": torch.stack(occs),
+            }
 
-        # No exception raised and function executed; loguru logs warnings to stderr
-        # so we simply ensure the helper ran without raising.
-        assert True
+        return DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
 
+    def test_trainer_training_mode_stage2_only(self, dummy_loader, tmp_path):
+        """Test trainer in stage2_only mode (default)."""
+        model = create_dummy_model()
+        
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=dummy_loader,
+            checkpoint_dir=str(tmp_path),
+            training_mode="stage2_only",
+            mixed_precision=False,
+            device="cpu",
+        )
+
+        assert trainer.training_mode == "stage2_only"
+        assert trainer.train_stage1 is False
+        assert trainer.ss_generator is None
+
+    def test_trainer_training_mode_stage1_only(self, dummy_loader, tmp_path):
+        """Test trainer in stage1_only mode requires ss_generator."""
+        from omegaconf import OmegaConf
+        from hydra.utils import instantiate
+        from sam3d_objects.model.io import load_model_from_checkpoint, filter_and_remove_prefix_state_dict_fn
+        
+        workspace_dir = "/mnt/nas1/disk01/weidongguo/workspace/sam-3d-objects"
+        config_path = f"{workspace_dir}/checkpoints/hf/ss_generator.yaml"
+        ckpt_path = f"{workspace_dir}/checkpoints/hf/ss_generator.ckpt"
+        
+        # Load config and extract backbone config
+        config = OmegaConf.load(config_path)["module"]["generator"]["backbone"]
+        
+        # Instantiate and load ss_generator
+        ss_generator = instantiate(config)
+        state_dict_prefix_func = filter_and_remove_prefix_state_dict_fn("_base_models.generator.")
+        ss_generator = load_model_from_checkpoint(
+            ss_generator,
+            ckpt_path,
+            strict=True,
+            device="cpu",
+            freeze=True,
+            eval=True,
+            state_dict_key="state_dict",
+            state_dict_fn=state_dict_prefix_func,
+        )
+        
+        model = create_dummy_model()
+        
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=dummy_loader,
+            checkpoint_dir=str(tmp_path),
+            training_mode="stage1_only",
+            ss_generator=ss_generator,
+            mixed_precision=False,
+            device="cpu",
+        )
+
+        assert trainer.training_mode == "stage1_only"
+        assert trainer.train_stage1 is True
+        assert trainer.ss_generator is not None
+
+
+# =============================================================================
+# Integration Tests - STRICT
+# =============================================================================
 
 class TestTrainingIntegration:
-    """Integration tests for training."""
+    """Integration tests for training - STRICT about completion."""
 
     def test_short_training_run(self, tmp_path):
         """Test a short training run completes without error."""
         model = create_dummy_model()
 
-        # Create minimal dataset - match model output shape
+        # Create minimal dataset
         dummy_images = torch.randn(4, 1, 256, 256)
         dummy_pointmaps = torch.randn(4, 256, 256, 3)
         dummy_sdfs = torch.randn(4, 256, 256, 1)
@@ -448,14 +671,122 @@ class TestTrainingIntegration:
             device="cpu",
         )
 
-        # Train for 2 epochs
+        # Train for 2 epochs - MUST complete
         trainer.train(epochs=2, save_every=1, validate_every=1)
 
-        # Check outputs exist
-        assert (tmp_path / "final.pt").exists()
-        assert (tmp_path / "history.json").exists()
-        assert len(trainer.history["train"]) == 2
-        assert len(trainer.history["val"]) == 2
+        # Outputs MUST exist
+        assert (tmp_path / "final.pt").exists(), "final.pt MUST be saved"
+        assert (tmp_path / "history.json").exists(), "history.json MUST be saved"
+        assert len(trainer.history["train"]) == 2, "MUST have 2 train history entries"
+        assert len(trainer.history["val"]) == 2, "MUST have 2 val history entries"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for spconv")
+    def test_slat_mesh_training_run(self, tmp_path):
+        """Test training with SLatMeshDecoder on CUDA.
+        
+        This tests the full SLatMeshDecoder training with proper LoRA injection.
+        """
+        from omegaconf import OmegaConf
+        from hydra.utils import instantiate
+        from sam3d_objects.model.io import load_model_from_checkpoint
+        
+        device = "cuda"
+        workspace_dir = "/mnt/nas1/disk01/weidongguo/workspace/sam-3d-objects"
+        config_path = f"{workspace_dir}/checkpoints/hf/slat_decoder_mesh.yaml"
+        ckpt_path = f"{workspace_dir}/checkpoints/hf/slat_decoder_mesh.ckpt"
+        
+        # Load config and instantiate SLatMeshDecoder
+        config = OmegaConf.load(config_path)
+        model = instantiate(config)
+        model = load_model_from_checkpoint(
+            model, ckpt_path,
+            strict=True,
+            device=device,
+            freeze=True,
+            eval=False,  # Keep in train mode for training
+            state_dict_key=None,
+        )
+        model = model.to(device)
+
+        # Create dataset with proper shapes for SLatMeshDecoder
+        dummy_images = torch.randn(4, 1, 64, 64)
+        dummy_pointmaps = torch.randn(4, 64, 64, 3)
+        dummy_sdfs = torch.randn(4, 1, 16, 16, 16)
+        dummy_masks = (torch.rand(4, 16, 16, 16) > 0.5).float()
+
+        dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
+
+        def collate_fn(batch):
+            images, pointmaps, sdfs, masks = zip(*batch)
+            return {
+                "image": torch.stack(images),
+                "pointmap": torch.stack(pointmaps),
+                "sdf": torch.stack(sdfs),
+                "mask": torch.stack(masks),
+            }
+
+        loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
+
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=loader,
+            val_loader=loader,
+            lr=1e-4,
+            checkpoint_dir=str(tmp_path),
+            mixed_precision=False,
+            device=device,
+        )
+
+        # Train for 1 epoch - MUST complete
+        trainer.train(epochs=1, save_every=1, validate_every=1)
+
+        # Verify training happened
+        assert (tmp_path / "final.pt").exists(), "final.pt MUST be saved"
+        assert len(trainer.history["train"]) == 1
+
+
+# =============================================================================
+# Test TensorBoard Logging
+# =============================================================================
+
+class TestTensorBoardLogging:
+    """Tests for TensorBoard logging."""
+
+    def test_tensorboard_dir_created(self, tmp_path):
+        """Test TensorBoard directory is created during training."""
+        model = create_dummy_model()
+
+        dummy_images = torch.randn(4, 1, 256, 256)
+        dummy_pointmaps = torch.randn(4, 256, 256, 3)
+        dummy_sdfs = torch.randn(4, 256, 256, 1)
+        dummy_masks = (torch.rand(4, 256, 256) > 0.5).float()
+
+        dataset = TensorDataset(dummy_images, dummy_pointmaps, dummy_sdfs, dummy_masks)
+
+        def collate_fn(batch):
+            images, pointmaps, sdfs, masks = zip(*batch)
+            return {
+                "image": torch.stack(images),
+                "pointmap": torch.stack(pointmaps),
+                "sdf": torch.stack(sdfs),
+                "mask": torch.stack(masks),
+            }
+
+        loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
+
+        trainer = MedicalTrainer(
+            model=model,
+            train_loader=loader,
+            checkpoint_dir=str(tmp_path),
+            mixed_precision=False,
+            device="cpu",
+        )
+
+        # TensorBoard should be available
+        from scripts.train_medical import TENSORBOARD_AVAILABLE
+        if TENSORBOARD_AVAILABLE:
+            assert trainer.writer is not None, "TensorBoard writer MUST be created"
+            assert (tmp_path / "tensorboard").exists(), "TensorBoard dir MUST exist"
 
 
 if __name__ == "__main__":

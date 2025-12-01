@@ -17,6 +17,7 @@ export LIDRA_SKIP_INIT=1
 #   --lora_rank <n>       Override LoRA rank
 #   --data_root <path>    Path to preprocessed data
 #   --resume <path>       Resume from checkpoint
+#   --stage <mode>        Training stage: stage1_only, stage2_only, two_stage (default: stage2_only)
 #   --help                Show this help
 #
 # All other config is in configs/train.yaml
@@ -29,6 +30,7 @@ GPU_ID="${GPU_ID:-1}"
 DATA_ROOT="${SAM3D_DATA_ROOT:-./dataset}"
 SLICE_CACHE="${SAM3D_SLICE_CACHE:-./dataset/ts_processed}"
 RESUME=""
+TRAINING_STAGE="stage2_only"
 
 # Hydra overrides collected here
 HYDRA_OVERRIDES=()
@@ -45,9 +47,10 @@ while [[ $# -gt 0 ]]; do
     --data_root) DATA_ROOT="$2"; shift 2;;
     --slice_cache) SLICE_CACHE="$2"; shift 2;;
     --resume) RESUME="$2"; shift 2;;
+    --stage) TRAINING_STAGE="$2"; shift 2;;
     --preprocess_crop_size) PREPROCESS_CROP_SIZE="$2"; shift 2;;
     --help)
-      sed -n '1,25p' "$0"
+      sed -n '1,28p' "$0"
       exit 0
       ;;
     *)
@@ -63,6 +66,7 @@ done
 # ============================================================
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 echo "Using GPU: $GPU_ID"
+echo "Training Stage: $TRAINING_STAGE"
 
 # Resolve paths
 DATA_ROOT=$(realpath "$DATA_ROOT" 2>/dev/null || echo "$DATA_ROOT")
@@ -75,13 +79,19 @@ fi
 # ============================================================
 echo "[Pipeline] Starting training with Hydra config"
 
-# Build command
+# Build command - use merged train_medical.py
 CMD=(
   python -u
-  scripts/train_medical_hydra.py
+  scripts/train_medical.py
   "data.data_root=$DATA_ROOT"
   "data.slice_cache_dir=$SLICE_CACHE"
+  "training.mode=$TRAINING_STAGE"
 )
+
+# Enable stage1 if needed
+if [[ "$TRAINING_STAGE" == "stage1_only" || "$TRAINING_STAGE" == "two_stage" ]]; then
+  CMD+=("stage1.enabled=true")
+fi
 
 # Add resume if specified
 if [[ -n "$RESUME" ]]; then
