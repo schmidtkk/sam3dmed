@@ -124,20 +124,29 @@ class FlexiCubes:
         """
         n_cubes = surf_cubes.shape[0]
 
+        # preserve input dtype to avoid mixing half/float
+        dtype = None
         if beta is not None:
+            dtype = beta.dtype
             beta = (torch.tanh(beta) * weight_scale + 1)
-        else:
-            beta = torch.ones((n_cubes, 12), dtype=torch.float, device=self.device)
+        if alpha is not None and dtype is None:
+            dtype = alpha.dtype
+        if gamma_f is not None and dtype is None:
+            dtype = gamma_f.dtype
+        if dtype is None:
+            dtype = torch.float
+        if beta is None:
+            beta = torch.ones((n_cubes, 12), dtype=dtype, device=self.device)
 
         if alpha is not None:
             alpha = (torch.tanh(alpha) * weight_scale + 1)
         else:
-            alpha = torch.ones((n_cubes, 8), dtype=torch.float, device=self.device)
+            alpha = torch.ones((n_cubes, 8), dtype=dtype, device=self.device)
 
         if gamma_f is not None:
             gamma_f = torch.sigmoid(gamma_f) * weight_scale + (1 - weight_scale) / 2
         else:
-            gamma_f = torch.ones((n_cubes), dtype=torch.float, device=self.device)
+            gamma_f = torch.ones((n_cubes), dtype=dtype, device=self.device)
 
         return beta[surf_cubes], alpha[surf_cubes], gamma_f[surf_cubes]
 
@@ -301,8 +310,18 @@ class FlexiCubes:
         # else:
         #     vd_color = None
 
-        vd = torch.zeros((total_num_vd, 3), device=self.device)
-        beta_sum = torch.zeros((total_num_vd, 1), device=self.device)
+        # Choose a common dtype to avoid mixed-precision index_add_ errors.
+        # Prefer highest precision among inputs: voxelgrid_vertices, beta, alpha, gamma_f
+        dtype = voxelgrid_vertices.dtype
+        if beta is not None:
+            dtype = torch.promote_types(dtype, beta.dtype)
+        if alpha is not None:
+            dtype = torch.promote_types(dtype, alpha.dtype)
+        if gamma_f is not None:
+            dtype = torch.promote_types(dtype, gamma_f.dtype)
+
+        vd = torch.zeros((total_num_vd, 3), device=self.device, dtype=dtype)
+        beta_sum = torch.zeros((total_num_vd, 1), device=self.device, dtype=dtype)
 
         idx_group = torch.gather(input=idx_map.reshape(-1), dim=0, index=edge_group_to_cube * 12 + edge_group)
 
@@ -326,7 +345,7 @@ class FlexiCubes:
         interpolate colors use the same method as dual vertices
         '''
         if voxelgrid_colors is not None:
-            vd_color = torch.zeros((total_num_vd, C), device=self.device)
+            vd_color = torch.zeros((total_num_vd, C), device=self.device, dtype=dtype)
             c_group = torch.index_select(input=surf_edges_c, index=idx_group.reshape(-1), dim=0).reshape(-1, 2, C)
             uc_group = self._linear_interp(s_group * alpha_group, c_group)
             vd_color = vd_color.index_add_(0, index=edge_group_to_vd, source=uc_group * beta_group) / beta_sum

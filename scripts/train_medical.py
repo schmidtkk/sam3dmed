@@ -349,7 +349,7 @@ class MedicalTrainer:
 
         for batch_idx, batch in enumerate(self.train_loader):
             # Move batch to device
-            batch = self._to_device(batch)
+            batch = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
             # Forward pass with mixed precision
             with torch.amp.autocast("cuda", enabled=self.mixed_precision):
@@ -417,7 +417,7 @@ class MedicalTrainer:
         val_losses = []
 
         for batch in self.val_loader:
-            batch = self._to_device(batch)
+            batch = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
             with torch.amp.autocast("cuda", enabled=self.mixed_precision):
                 outputs = self._forward_step(batch)
@@ -622,101 +622,9 @@ class MedicalTrainer:
         sparse_tensor = sp.SparseTensor(feats=feats, coords=coords)
         return sparse_tensor
 
-
-def _find_yaml_for_ckpt(ckpt_path: str) -> Optional[str]:
-    """
-    Try to find a YAML config file corresponding to a checkpoint file.
-    It checks the same directory for files with the same stem and .yaml or .yml extension.
-    """
-    if ckpt_path is None:
-        return None
-    ckpt_path = str(ckpt_path)
-    try:
-        folder = os.path.dirname(ckpt_path)
-        stem = os.path.splitext(os.path.basename(ckpt_path))[0]
-        for ext in (".yaml", ".yml"):
-            cand = os.path.join(folder, stem + ext)
-            if os.path.exists(cand):
-                return cand
-    except Exception:
-        pass
-    return None
-
-
-def _extract_model_params_from_yaml(yaml_path: str, model_name: str) -> dict:
-    """
-    Extract model parameter dict from a checkpoint YAML config for the given model name.
-    Supports `slat_mesh` and `slat_generator` extraction heuristics.
-    """
-    if yaml_path is None:
-        return {}
-    oc = OmegaConf.load(yaml_path)
-    params = {}
-    try:
-        if model_name in ("slat_mesh", "slat_decoder", "slat_decoder_mesh"):
-            # Common keys at top-level
-            for k in ["resolution", "model_channels", "latent_channels", "num_blocks", "num_heads", "use_fp16", "use_checkpoint", "representation_config"]:
-                if k in oc:
-                    params[k] = oc[k]
-        elif model_name in ("slat_generator", "slat_flow", "slat_flow_model"):
-            # Try nested path used in pipeline YAML
-            # e.g., module.generator.backbone.backbone.model
-            nested_keys = [
-                ("module", "generator", "backbone", "backbone", "model"),
-                ("module", "generator", "backbone", "model"),
-            ]
-            for path in nested_keys:
-                node = oc
-                valid = True
-                for p in path:
-                    if isinstance(node, dict) and p in node:
-                        node = node[p]
-                    elif hasattr(node, p):
-                        node = node.get(p)
-                    else:
-                        valid = False
-                        break
-                if valid and isinstance(node, dict):
-                    for k in ["model_channels", "in_channels", "out_channels", "num_blocks", "num_heads", "io_block_channels", "use_fp16", "patch_size"]:
-                        if k in node:
-                            params[k] = node[k]
-                    break
-            # Fallback to top-level if missing
-            for k in ["model_channels", "in_channels", "out_channels"]:
-                if k in oc:
-                    params[k] = oc[k]
-    except Exception:
-        pass
-    return params
-
-
-def _safe_load_checkpoint(path: str):
-    """
-    Safely load a checkpoint file (torch or safetensors). Returns the object loaded or OrderedDict.
-    """
-    if not path:
-        return None
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Checkpoint path not found: {path}")
-    if path.endswith('.safetensors'):
-        try:
-            from safetensors.torch import load_file
-
-            return load_file(path)
-        except Exception:
-            # Fall back to torch.load
-            pass
-    try:
-        return torch.load(path, map_location='cpu')
-    except Exception:
-        # Some older files may require non-weights only load
-        return torch.load(path, map_location='cpu', weights_only=False)
-
-    def _compute_losses(
-        self,
-        outputs,
-        batch: dict,
-    ) -> dict[str, torch.Tensor]:
+    # Backwards-compatible wrappers in case global module
+    # functions exist (due to previous indentation issues).
+    def _compute_losses(self, outputs, batch: dict) -> dict[str, torch.Tensor]:
         """
         Compute losses from model outputs and batch.
 
@@ -755,11 +663,7 @@ def _safe_load_checkpoint(path: str):
             gt_occupancy=gt_occupancy,
         )
 
-    def _compute_mesh_losses(
-        self,
-        mesh_results: list,
-        batch: dict,
-    ) -> dict[str, torch.Tensor]:
+    def _compute_mesh_losses(self, mesh_results: list, batch: dict) -> dict[str, torch.Tensor]:
         """
         Compute losses from List[MeshExtractResult] output.
 
@@ -851,29 +755,24 @@ def _safe_load_checkpoint(path: str):
 
         This helper is enabled only when SANITY_DEBUG env var is set to '1'.
         """
-        import os
+        import os as _os
 
-        if os.environ.get("SANITY_DEBUG") != "1":
+        if _os.environ.get("SANITY_DEBUG") != "1":
             return
 
-        def _check_tensor(name, t):
-            if t is None:
-                return
-            if not isinstance(t, torch.Tensor):
+        def _check_tensor(name: str, t: torch.Tensor | None) -> None:
+            if t is None or not isinstance(t, torch.Tensor):
                 return
             if not t.isfinite().all():
                 nans = (~t.isfinite()).sum().item()
                 logger.warning(f"Non-finite detected in {name} at batch {batch_idx}: count={nans}, shape={t.shape}")
             else:
-                # Optionally log min/max for numeric issues
                 try:
-                    t_min = t.min().item()
-                    t_max = t.max().item()
+                    t_min, t_max = t.min().item(), t.max().item()
                 except Exception:
                     t_min, t_max = None, None
                 logger.debug(f"{name} finite: shape={t.shape}, min={t_min}, max={t_max}")
 
-        # Check some expected keys
         for k in ("image", "pointmap", "mask_sdf", "segmentation"):
             if k in batch:
                 _check_tensor(f"batch.{k}", batch[k])
@@ -882,7 +781,7 @@ def _safe_load_checkpoint(path: str):
 
     def _aggregate_losses(self, losses_list: list[dict]) -> dict[str, float]:
         """Aggregate list of loss dicts into means."""
-        aggregated = {}
+        aggregated: dict[str, float] = {}
         for key in losses_list[0].keys():
             aggregated[key] = sum(d[key] for d in losses_list) / len(losses_list)
         return aggregated
@@ -935,6 +834,96 @@ def _safe_load_checkpoint(path: str):
         with open(path, "w") as f:
             json.dump(self.history, f, indent=2)
         logger.info(f"History saved: {path}")
+
+
+def _find_yaml_for_ckpt(ckpt_path: str) -> Optional[str]:
+    """
+    Try to find a YAML config file corresponding to a checkpoint file.
+    It checks the same directory for files with the same stem and .yaml or .yml extension.
+    """
+    if ckpt_path is None:
+        return None
+    ckpt_path = str(ckpt_path)
+    try:
+        folder = os.path.dirname(ckpt_path)
+        stem = os.path.splitext(os.path.basename(ckpt_path))[0]
+        for ext in (".yaml", ".yml"):
+            cand = os.path.join(folder, stem + ext)
+            if os.path.exists(cand):
+                return cand
+    except Exception:
+        pass
+    return None
+
+
+def _extract_model_params_from_yaml(yaml_path: str, model_name: str) -> dict:
+    """
+    Extract model parameter dict from a checkpoint YAML config for the given model name.
+    Supports `slat_mesh` and `slat_generator` extraction heuristics.
+    """
+    if yaml_path is None:
+        return {}
+    oc = OmegaConf.load(yaml_path)
+    params = {}
+    try:
+        if model_name in ("slat_mesh", "slat_decoder", "slat_decoder_mesh"):
+            # Common keys at top-level
+            for k in ["resolution", "model_channels", "latent_channels", "num_blocks", "num_heads", "use_fp16", "use_checkpoint", "representation_config"]:
+                if k in oc:
+                    params[k] = oc[k]
+        elif model_name in ("slat_generator", "slat_flow", "slat_flow_model"):
+            # Try nested path used in pipeline YAML
+            # e.g., module.generator.backbone.backbone.model
+            nested_keys = [
+                ("module", "generator", "backbone", "backbone", "model"),
+                ("module", "generator", "backbone", "model"),
+            ]
+            for path in nested_keys:
+                node = oc
+                valid = True
+                for p in path:
+                    if isinstance(node, dict) and p in node:
+                        node = node[p]
+                    elif hasattr(node, p):
+                        node = node.get(p)
+                    else:
+                        valid = False
+                        break
+                if valid and isinstance(node, dict):
+                    for k in ["model_channels", "in_channels", "out_channels", "num_blocks", "num_heads", "io_block_channels", "use_fp16", "patch_size"]:
+                        if k in node:
+                            params[k] = node[k]
+                    break
+            # Fallback to top-level if missing
+            for k in ["model_channels", "in_channels", "out_channels"]:
+                if k in oc:
+                    params[k] = oc[k]
+    except Exception:
+        pass
+    return params
+
+
+def _safe_load_checkpoint(path: str):
+    """
+    Safely load a checkpoint file (torch or safetensors). Returns the object loaded or OrderedDict.
+    """
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint path not found: {path}")
+    if path.endswith('.safetensors'):
+        try:
+            from safetensors.torch import load_file
+
+            return load_file(path)
+        except Exception:
+            # Fall back to torch.load
+            pass
+    try:
+        return torch.load(path, map_location='cpu')
+    except Exception:
+        # Some older files may require non-weights only load
+        return torch.load(path, map_location='cpu', weights_only=False)
 
 
 def create_dummy_model():
@@ -1178,6 +1167,9 @@ def main():
                 raise ValueError(
                     "No model params provided and no checkpoint YAML found adjacent to resume checkpoint. Provide --model_params or use a checkpoint with a YAML file."
                 )
+    # Ensure model 'use_fp16' respects no_mixed_precision
+    if args.no_mixed_precision and model_params is not None:
+        model_params["use_fp16"] = False
     model = create_model(name=args.model_name, params=model_params)
 
     # Create trainer
@@ -1193,6 +1185,8 @@ def main():
                 logger.warning("Found generator ckpt YAML but couldn't extract params: %s", yaml_path)
 
     slat_generator_ckpt = args.slat_generator_ckpt
+
+    # slat_generator_params already loaded from CLI args earlier; no Hydra cfg here
 
     trainer = MedicalTrainer(
         model=model,
@@ -1288,6 +1282,7 @@ def train_from_config(cfg: dict):
     args.data_root = cfg.get("data", {}).get("data_root")
     args.slice_cache_dir = cfg.get("data", {}).get("slice_cache_dir")
     args.augment = bool(cfg.get("data", {}).get("augment", False))
+    args.preprocess_crop_size = tuple(cfg.get("data", {}).get("preprocess_crop_size", (256, 256)))
 
     # Device
     args.device = cfg.get("device", "cuda")
@@ -1309,6 +1304,7 @@ def train_from_config(cfg: dict):
         classes=1,
         augment=args.augment,
         augment_mode="train",
+        preprocess_crop_size=args.preprocess_crop_size,
         occupancy_threshold=0.01,
     )
     from torch.utils.data import DataLoader
@@ -1321,8 +1317,12 @@ def train_from_config(cfg: dict):
         num_workers=args.num_workers,
     )
 
-    # Preprocess model cfg from provided config: if no params provided, try to load from checkpoint YAML; else fail.
-    if not model_cfg.get("params"):
+    # Preprocess model cfg from provided config: prepare model config variables and
+    # if no params provided, try to load from checkpoint YAML; else fail.
+    model_cfg = cfg.get("model", {})
+    model_name = model_cfg.get("name", "slat_mesh")
+    model_params = model_cfg.get("params", {})
+    if not model_params:
         # Only allowed when resuming from a checkpoint that includes a YAML; otherwise the user must explicitly provide params
         resume_ckpt = args.resume or cfg.get("checkpoint", {}).get("resume")
         if resume_ckpt:
@@ -1346,7 +1346,21 @@ def train_from_config(cfg: dict):
     model_cfg = cfg.get("model", {})
     model_name = model_cfg.get("name", "slat_mesh")
     model_params = model_cfg.get("params", {})
+    # Ensure model 'use_fp16' respects no_mixed_precision when running via Hydra
+    if args.no_mixed_precision and model_params is not None:
+        model_params["use_fp16"] = False
     model = create_model(name=model_name, params=model_params)
+    # Pull slat generator params from Hydra config or YAML if present
+    slat_generator_ckpt = cfg.get("slat_generator_ckpt", None)
+    slat_generator_params = cfg.get("slat_generator_params", None)
+    if slat_generator_params is None and slat_generator_ckpt:
+        yaml_path = _find_yaml_for_ckpt(slat_generator_ckpt)
+        if yaml_path is not None:
+            ext_params = _extract_model_params_from_yaml(yaml_path, "slat_generator")
+            if ext_params:
+                slat_generator_params = ext_params
+            else:
+                logger.warning("Found generator checkpoint YAML but could not extract params: %s", yaml_path)
     trainer = MedicalTrainer(
         model=model,
         train_loader=train_loader,

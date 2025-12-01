@@ -17,6 +17,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from sam3d_objects.data.dataset.tdfy.preprocessor import PreProcessor
@@ -92,7 +93,10 @@ class TS_SAM3D_Dataset(Dataset):
         self.include_pose = bool(include_pose)
 
         # PreProcessor: default settings; the user can inject custom transforms via kwargs
-        self.preprocessor = kwargs.get("preprocessor", PreProcessor())
+        self.preprocessor = kwargs.get(
+            "preprocessor",
+            PreProcessor(preprocess_crop_size=self.preprocess_crop_size),
+        )
 
         # Per-slice augmentor
         self.augmentor = create_augmentor(enable=augment, mode=augment_mode)
@@ -418,24 +422,105 @@ class TS_SAM3D_Dataset(Dataset):
 
 
 # collate function similar to TS loader
+def _pad_to_target(tensor: torch.Tensor, target_h: int, target_w: int, pad_value=0.0) -> torch.Tensor:
+    """Pad a tensor of shape (C,H,W) or (H,W) to (C,target_h,target_w) or (target_h,target_w).
+    pad_value will be used for padding constant values (e.g., 0 or NaN).
+    """
+    if tensor is None:
+        return None
+    if tensor.ndim == 3:
+        c, h, w = tensor.shape
+    elif tensor.ndim == 2:
+        c = None
+        h, w = tensor.shape
+    else:
+        # Unexpected dims - return unchanged
+        return tensor
+    if h == target_h and w == target_w:
+        return tensor
+    # compute padding: pad=(left, right, top, bottom)
+    pad_w = target_w - w
+    pad_h = target_h - h
+    left = pad_w // 2
+    right = pad_w - left
+    top = pad_h // 2
+    bottom = pad_h - top
+    # F.pad expects pad=(left, right, top, bottom)
+    if c is None:
+        padded = F.pad(tensor.unsqueeze(0), (left, right, top, bottom), value=pad_value).squeeze(0)
+    else:
+        padded = F.pad(tensor, (left, right, top, bottom), value=pad_value)
+    return padded
+
+
 def data_collate(batch):
-    img = torch.stack([item["image"] for item in batch])
-    mask_sdf = torch.stack(
-        [
-            item["mask_sdf"] if item["mask_sdf"] is not None else torch.zeros((1, 1, 1))
-            for item in batch
-        ]
-    )
-    segmentation = torch.stack([item["mask"] for item in batch])
+    # Determine the max height & width in the batch to pad to
+    heights = [item["image"].shape[-2] for item in batch]
+    widths = [item["image"].shape[-1] for item in batch]
+    max_h = max(heights)
+    max_w = max(widths)
+
+    # Pad images (pad with zeros)
+    img_list = [
+        _pad_to_target(item["image"], max_h, max_w, pad_value=0.0) for item in batch
+    ]
+    img = torch.stack(img_list)
+    # mask_sdf may be of shape (C, D, H, W) or None; pad H/W dims if needed
+    mask_sdf_list = []
+    for item in batch:
+        ms = item["mask_sdf"] if item["mask_sdf"] is not None else None
+        if ms is None:
+            # create zeros of (1,1,max_h,max_w)
+            mask_sdf_list.append(torch.zeros((1, 1, max_h, max_w)))
+        else:
+            # ms can be (C,D,H,W), (C,H,W) or (H,W) depending on precomputed cache
+            if ms.ndim == 4:
+                c, d, h, w = ms.shape
+            elif ms.ndim == 3:
+                # (C,H,W) -> (C,1,H,W)
+                c, h, w = ms.shape
+                d = 1
+                ms = ms.unsqueeze(1)
+            elif ms.ndim == 2:
+                # (H,W) -> (1,1,H,W)
+                h, w = ms.shape
+                c, d = 1, 1
+                ms = ms.unsqueeze(0).unsqueeze(0)
+            else:
+                # Unexpected dims - convert to zeros
+                mask_sdf_list.append(torch.zeros((1, 1, max_h, max_w)))
+                continue
+            if h != max_h or w != max_w:
+                # pad (left,right,top,bottom) for last two dims
+                pad_w = max_w - w
+                pad_h = max_h - h
+                left = pad_w // 2
+                right = pad_w - left
+                top = pad_h // 2
+                bottom = pad_h - top
+                # pad expects (left,right,top,bottom) and operates on last dims
+                ms = F.pad(ms, (left, right, top, bottom), value=0.0)
+            mask_sdf_list.append(ms)
+    mask_sdf = torch.stack(mask_sdf_list)
+    # segmentation masks may vary in H/W - pad with zeros
+    segmentation = torch.stack([
+        _pad_to_target(item["mask"], max_h, max_w, pad_value=0.0) for item in batch
+    ])
     name = [item["name"] for item in batch]
     
     # Stack pointmaps (required for training)
-    pointmap = torch.stack(
-        [
-            item["pointmap"] if item["pointmap"] is not None else torch.zeros_like(item["image"])
-            for item in batch
-        ]
-    )
+    # pointmap: pad with NaN for unknown areas
+    pointmap_list = []
+    for item in batch:
+        pm = item.get("pointmap", None)
+        if pm is None:
+            # generate NaN-filled pointmap with same channels as image (assume 3)
+            ch = item["image"].shape[0]
+            pm = torch.full((ch, max_h, max_w), float("nan"))
+        else:
+            pm = _pad_to_target(pm, max_h, max_w, pad_value=float("nan"))
+        pointmap_list.append(pm)
+    pointmap = torch.stack(pointmap_list)
 
     affine_tensors = []
     for item in batch:

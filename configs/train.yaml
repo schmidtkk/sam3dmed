@@ -1,45 +1,66 @@
-# Hydra config for training
-version_base: 1.1
+# Hydra config for medical fine-tuning
+# All training parameters are configured here. Override via CLI:
+#   python scripts/train_medical_hydra.py training.batch_size=8 lora.rank=8
+# Example: override preprocess_crop_size (use JSON-like list syntax):
+#   python scripts/train_medical_hydra.py data.preprocess_crop_size=[256,256]
 
-# Data
+defaults:
+  - _self_
+
+# Data configuration
 data:
   use_dataset: true
-  data_root: /path/to/preprocessed
-  slice_cache_dir: null
-  augment: false
+  # Path to preprocessed data (set via CLI or environment)
+  data_root: ${oc.env:SAM3D_DATA_ROOT,./dataset}
+  # Slice cache directory for TS_SAM3D_Dataset
+  slice_cache_dir: ${oc.env:SAM3D_SLICE_CACHE,./dataset/ts_processed}
+  augment: true
   classes: 1
+  val_split: 0.1
+  # Preprocess: crop or pad to fixed HxW during preprocessing (applies before augmentations)
+  preprocess_crop_size: [256, 256]
 
-# Training param
+# Training parameters
 training:
   batch_size: 4
   epochs: 50
-  lr: 0.001
+  lr: 1e-3
   weight_decay: 0.01
   grad_accum: 1
+  grad_clip_norm: 1.0
   num_workers: 4
-  mixed_precision: true
-  # Scheduler options
+  mixed_precision: false
+  # Scheduler configuration
   scheduler:
     name: onecycle
-    max_lr: 0.001
+    max_lr: ${training.lr}
     pct_start: 0.1
     anneal_strategy: cos
 
-# LoRA
+# LoRA configuration
 lora:
   rank: 4
   alpha: 8.0
+  dropout: 0.0
 
-# Device
+# Loss weights
+loss:
+  sdf_weight: 1.0
+  chamfer_weight: 0.5
+  mesh_reg_weight: 0.1
+  occupancy_weight: 1.0
+
+# Device configuration
 device: cuda
 
-# Checkpoint
+# Checkpoint configuration
 checkpoint:
-  dir: ./checkpoints/medical
+  dir: ${oc.env:SAM3D_CHECKPOINT_DIR,./checkpoints/medical}
   resume: null
-  save_every: 1
+  save_every: 5
+  validate_every: 1
 
-# Model
+# Model configuration - aligned with pretrained slat_decoder_mesh.yaml
 model:
   name: slat_mesh
   params:
@@ -48,5 +69,15 @@ model:
     latent_channels: 8
     num_blocks: 12
     num_heads: 12
-    use_fp16: true
+    use_fp16: false
     use_checkpoint: false
+
+# Hydra output configuration
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

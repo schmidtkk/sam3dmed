@@ -8,6 +8,3 @@ dataset/
 *.nii.gz
 outputs/
 results/
-
-# NFS temp files
-.nfs*nnUNet_preprocessed/

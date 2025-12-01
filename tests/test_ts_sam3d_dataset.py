@@ -241,6 +241,29 @@ def test_collate_function():
     assert len(collated["name"]) == 2, "Should have 2 names"
     assert collated["affine"].shape == (2, 4, 4), "Affine should be batched"
 
+    # Now ensure collate handles different image sizes by padding
+    batch_var = [
+        {
+            "image": torch.randn(3, 64, 64),
+            "mask": torch.randint(0, 2, (64, 64)).float(),
+            "mask_sdf": torch.randn(1, 1, 64, 64),
+            "affine": torch.eye(4),
+            "name": "case1",
+        },
+        {
+            "image": torch.randn(3, 62, 60),
+            "mask": torch.randint(0, 2, (62, 60)).float(),
+            "mask_sdf": torch.randn(1, 1, 62, 60),
+            "affine": torch.eye(4),
+            "name": "case2",
+        },
+    ]
+
+    collated2 = data_collate(batch_var)
+    assert collated2["image"].shape[2] == collated2["image"].shape[3]
+    # Heights and widths should be equalized by padding
+    assert collated2["image"].shape[2] >= 64 and collated2["image"].shape[3] >= 64
+
 
 def test_augmentor_create():
     """Test augmentor creation function."""

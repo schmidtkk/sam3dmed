@@ -62,16 +62,43 @@ class LoRALinear(nn.Module):
         # Dropout for LoRA path
         self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
 
-        # Initialize A with kaiming uniform (like typical LoRA)
-        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+        # Initialize A with scaled normal (more stable than kaiming for FP16)
+        # Using smaller scale to prevent overflow with mixed precision
+        nn.init.normal_(self.lora_A, mean=0.0, std=0.02)
         # Initialize B with zeros so initial output is same as original
         nn.init.zeros_(self.lora_B)
 
         # Store whether original linear had bias
         self.has_bias = original_linear.bias is not None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Original linear pass
+    def _is_sparse_tensor(self, x) -> bool:
+        """Check if x is a SparseTensor (from tdfy_dit.modules.sparse)."""
+        return hasattr(x, 'feats') and hasattr(x, 'replace')
+
+    def forward(self, x):
+        """Forward pass supporting both regular Tensors and SparseTensors.
+        
+        For SparseTensor inputs (from SparseLinear), we operate on the .feats
+        attribute and return a new SparseTensor via .replace().
+        """
+        # Handle SparseTensor inputs (from SparseLinear in the backbone)
+        if self._is_sparse_tensor(x):
+            # Extract features from SparseTensor
+            feats = x.feats
+            
+            # Original linear pass on features
+            result = self.original_linear(x)  # Returns SparseTensor
+            
+            # LoRA path on features
+            lora_x = self.lora_dropout(feats)
+            lora_out = lora_x @ self.lora_A.T
+            lora_out = lora_out @ self.lora_B.T
+            lora_out = lora_out * self.scaling
+            
+            # Add LoRA output to result features and return new SparseTensor
+            return result.replace(result.feats + lora_out)
+        
+        # Standard tensor path
         result = self.original_linear(x)
 
         # LoRA path: x -> dropout -> A -> B -> scale
@@ -305,11 +332,12 @@ def setup_lora_for_medical_finetuning(
     dropout: float = 0.0,
     unfreeze_output_layers: bool = True,
     output_layer_names: list[str] | None = None,
+    include_ffn: bool = False,
 ) -> dict[str, int]:
     """
     Complete setup for medical fine-tuning with LoRA.
 
-    1. Inject LoRA into attention layers
+    1. Inject LoRA into attention layers (and optionally FFN)
     2. Freeze base weights
     3. Optionally unfreeze output layers
 
@@ -320,14 +348,23 @@ def setup_lora_for_medical_finetuning(
         dropout: LoRA dropout
         unfreeze_output_layers: Whether to also train output layers
         output_layer_names: Patterns for output layers to unfreeze
+        include_ffn: Whether to also inject LoRA into FFN/MLP layers
 
     Returns:
         Dict with parameter counts
     """
+    # Target modules - attention projections
+    target_modules = ["to_qkv", "to_q", "to_kv", "to_out"]
+    
+    # Optionally add FFN/MLP layer patterns for more comprehensive fine-tuning
+    if include_ffn:
+        # These patterns match FFN layers in SparseTransformerBlock and similar
+        target_modules.extend(["mlp", "ffn", "fc1", "fc2"])
+    
     # Inject LoRA
     inject_lora(
         model,
-        target_modules=["to_qkv", "to_q", "to_kv", "to_out"],
+        target_modules=target_modules,
         rank=rank,
         alpha=alpha,
         dropout=dropout,

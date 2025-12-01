@@ -40,6 +40,7 @@ class PreProcessor:
     normalize_pointmap: bool = False
     pointmap_normalizer: Optional[Callable] = None
     rgb_pointmap_normalizer: Optional[Callable] = None
+    preprocess_crop_size: tuple[int, int] = (256, 256)
 
     def __post_init__(self):
         if self.pointmap_normalizer is None:
@@ -50,6 +51,108 @@ class PreProcessor:
         if self.rgb_pointmap_normalizer is None:
             logger.warning("No rgb pointmap normalizer provided, using scale + shift ")
             self.rgb_pointmap_normalizer = self.pointmap_normalizer
+
+        # Ensure a CropOrPad joint transform exists to enforce consistent output size
+        try:
+            import torch.nn.functional as F
+        except Exception:
+            F = None
+
+        def _crop_or_pad_joint(img, mask, pointmap=None):
+            """Center crop or pad the image/mask/pointmap to self.preprocess_crop_size.
+
+            Pads image and mask with zeros; pad pointmap with NaNs.
+            """
+            th, tw = self.preprocess_crop_size
+            # image: (C,H,W)
+            if img is not None:
+                c, h, w = img.shape
+                # crop
+                if h > th:
+                    top = (h - th) // 2
+                    img = img[:, top : top + th, :]
+                if w > tw:
+                    left = (w - tw) // 2
+                    img = img[:, :, left : left + tw]
+                # pad
+                if h < th or w < tw:
+                    ph = th - img.shape[1]
+                    pw = tw - img.shape[2]
+                    left = pw // 2
+                    right = pw - left
+                    top = ph // 2
+                    bottom = ph - top
+                    if F is not None:
+                        img = F.pad(img, (left, right, top, bottom), value=0.0)
+                    else:
+                        pad_tensor = torch.zeros((c, th, tw), dtype=img.dtype)
+                        pad_tensor[:, top : top + img.shape[1], left : left + img.shape[2]] = img
+                        img = pad_tensor
+            # mask: (H,W)
+            if mask is not None:
+                if mask.ndim == 3:
+                    mask = mask[0]
+                h, w = mask.shape
+                if h > th:
+                    top = (h - th) // 2
+                    mask = mask[top : top + th, :]
+                if w > tw:
+                    left = (w - tw) // 2
+                    mask = mask[:, left : left + tw]
+                if h < th or w < tw:
+                    ph = th - mask.shape[0]
+                    pw = tw - mask.shape[1]
+                    left = pw // 2
+                    top = ph // 2
+                    if F is not None:
+                        mask = F.pad(mask.unsqueeze(0), (left, pw - left, top, ph - top), value=0.0).squeeze(0)
+                    else:
+                        pad_mask = torch.zeros((th, tw), dtype=mask.dtype)
+                        pad_mask[top : top + mask.shape[0], left : left + mask.shape[1]] = mask
+                        mask = pad_mask
+            # pointmap: (C,H,W) or None - pad with NaNs
+            if pointmap is not None:
+                ch, h, w = pointmap.shape
+                if h > th:
+                    top = (h - th) // 2
+                    pointmap = pointmap[:, top : top + th, :]
+                if w > tw:
+                    left = (w - tw) // 2
+                    pointmap = pointmap[:, :, left : left + tw]
+                if h < th or w < tw:
+                    ph = th - pointmap.shape[1]
+                    pw = tw - pointmap.shape[2]
+                    left = pw // 2
+                    right = pw - left
+                    top = ph // 2
+                    bottom = ph - top
+                    if F is not None:
+                        pointmap = F.pad(pointmap, (left, right, top, bottom), value=float("nan"))
+                    else:
+                        pad_pm = torch.full((ch, th, tw), float("nan"), dtype=pointmap.dtype)
+                        pad_pm[:, top : top + pointmap.shape[1], left : left + pointmap.shape[2]] = pointmap
+                        pointmap = pad_pm
+            return img, mask, pointmap
+
+        # Prepend to img_mask_pointmap_joint_transform if it's empty or sentinel
+        if (
+            (self.img_mask_pointmap_joint_transform == (None,) or self.img_mask_pointmap_joint_transform is None)
+            and (self.img_mask_joint_transform == (None,) or self.img_mask_joint_transform is None)
+        ):
+            # No joint transforms defined: set single crop/pad transform
+            self.img_mask_pointmap_joint_transform = [ _crop_or_pad_joint ]
+        elif self.img_mask_pointmap_joint_transform == (None,) or self.img_mask_pointmap_joint_transform is None:
+            # There is a img_mask_joint_transform but no img_mask_pointmap_joint_transform, set crop/pad before existing list
+            existing = self.img_mask_joint_transform if self.img_mask_joint_transform not in ((None,), None) else []
+            self.img_mask_pointmap_joint_transform = [ _crop_or_pad_joint ] + list(existing)
+        else:
+            # Prepend crop/pad to the existing img_mask_pointmap_joint_transform list
+            if isinstance(self.img_mask_pointmap_joint_transform, list):
+                self.img_mask_pointmap_joint_transform = [ _crop_or_pad_joint ] + self.img_mask_pointmap_joint_transform
+            else:
+                # If it's a single callable, convert to list
+                if self.img_mask_pointmap_joint_transform != (None,):
+                    self.img_mask_pointmap_joint_transform = [ _crop_or_pad_joint, self.img_mask_pointmap_joint_transform ]
 
 
     def _normalize_pointmap(

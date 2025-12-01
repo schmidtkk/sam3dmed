@@ -81,7 +81,25 @@ def get_dense_attrs(coords: torch.Tensor, feats: torch.Tensor, res: int, sdf_ini
     dense_attrs = torch.zeros([res] * 3 + [F], device=feats.device, dtype=feats.dtype)
     if sdf_init:
         dense_attrs[..., 0] = 1  # initial outside sdf value
-    dense_attrs[coords[:, 0], coords[:, 1], coords[:, 2], :] = feats
+    # Defensive: only index with coords that fall within valid range [0, res)
+    # This avoids device-side assertions on invalid indexing (from noisy coords)
+    coords_long = coords.long()
+    valid_mask = (
+        (coords_long[:, 0] >= 0)
+        & (coords_long[:, 0] < res)
+        & (coords_long[:, 1] >= 0)
+        & (coords_long[:, 1] < res)
+        & (coords_long[:, 2] >= 0)
+        & (coords_long[:, 2] < res)
+    )
+    if not valid_mask.all():
+        # Keep only valid coords to prevent indexing errors
+        coords_valid = coords_long[valid_mask]
+        feats_valid = feats[valid_mask]
+        if coords_valid.shape[0] > 0:
+            dense_attrs[coords_valid[:, 0], coords_valid[:, 1], coords_valid[:, 2], :] = feats_valid
+    else:
+        dense_attrs[coords_long[:, 0], coords_long[:, 1], coords_long[:, 2], :] = feats
     return dense_attrs.reshape(-1, F)
 
 
