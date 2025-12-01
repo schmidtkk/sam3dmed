@@ -30,7 +30,7 @@ GPU_ID="${GPU_ID:-1}"
 DATA_ROOT="${SAM3D_DATA_ROOT:-./dataset}"
 SLICE_CACHE="${SAM3D_SLICE_CACHE:-./dataset/ts_processed}"
 RESUME=""
-TRAINING_STAGE="stage2_only"
+TRAINING_STAGE="two_stage"
 
 # Hydra overrides collected here
 HYDRA_OVERRIDES=()

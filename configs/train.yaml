@@ -84,6 +84,7 @@ stage1:
   ss_generator_config: ${oc.env:SAM3D_SS_GENERATOR_CONFIG,./checkpoints/hf/ss_generator.yaml}
   # Checkpoint for pretrained ss_decoder
   ss_decoder_ckpt: ${oc.env:SAM3D_SS_DECODER_CKPT,./checkpoints/hf/ss_decoder.ckpt}
+  ss_decoder_config: ${oc.env:SAM3D_SS_DECODER_CONFIG,./checkpoints/hf/ss_decoder.yaml}
   # Whether to fine-tune ss_generator with LoRA
   finetune: true
   # Loss weights for Stage 1

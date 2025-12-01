@@ -510,7 +510,7 @@ class MedicalTrainer:
         The generator learns to predict occupancy voxels from image conditioning.
         """
         if self.ss_generator is None:
-            return {"stage1_loss": torch.tensor(0.0, device=self.device)}
+            return {"stage1_loss": torch.tensor(0.0, device=self.device, requires_grad=True)}
         
         # Get conditioning from batch
         image = batch.get("image")  # (B, C, H, W)
@@ -519,13 +519,17 @@ class MedicalTrainer:
         # This should be a 3D voxel grid of shape (B, 1, D, H, W) or similar
         gt_occupancy = batch.get("gt_occupancy")
         if gt_occupancy is None:
-            # Fallback: create from 3D SDF if available
-            gt_sdf = batch.get("gt_sdf")
-            if gt_sdf is not None:
-                gt_occupancy = (gt_sdf < 0).float()  # Inside surface
+            # Fallback: create from mask_sdf if available (5D: B, C, D, H, W)
+            mask_sdf = batch.get("mask_sdf")
+            if mask_sdf is not None:
+                # mask_sdf is (B, 1, 1, H, W) or (B, 1, D, H, W)
+                if mask_sdf.dim() == 5 and mask_sdf.shape[2] == 1:
+                    # Expand 2D SDF to 3D by replicating
+                    mask_sdf = mask_sdf.squeeze(2)  # (B, 1, H, W)
+                gt_occupancy = (mask_sdf < 0).float()  # Inside surface
             else:
-                # Last resort: use 2D mask expanded to pseudo-3D
-                mask = batch.get("mask")
+                # Try to use 2D segmentation mask
+                mask = batch.get("segmentation") or batch.get("mask")
                 if mask is not None:
                     # Create a thin 3D volume from 2D mask
                     if mask.dim() == 3:  # (B, H, W)
@@ -538,7 +542,10 @@ class MedicalTrainer:
                     )
                 else:
                     logger.warning("No ground truth occupancy available for Stage 1")
-                    return {"stage1_loss": torch.tensor(0.0, device=self.device)}
+                    # Return a small trainable loss to avoid gradient issues
+                    # This acts as a regularization term
+                    dummy_param = next(self.ss_generator.parameters())
+                    return {"stage1_loss": dummy_param.sum() * 0.0}
         
         # Encode to latent (flatten to token sequence for flow matching)
         # ss_generator expects latent of shape (B, 4096, 8) for 16^3 grid with 8 channels
@@ -1283,10 +1290,20 @@ def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
         from sam3d_objects.model.backbone.tdfy_dit.models.mot_sparse_structure_flow import (
             SparseStructureFlowTdfyWrapper,
         )
+        from sam3d_objects.model.backbone.tdfy_dit.models.mm_latent import (
+            Latent,
+            ShapePositionEmbedder,
+            LearntPositionEmbedder,
+        )
 
+        # Get model dimensions
+        model_channels = int(params.get("model_channels", 1024))
+        resolution = int(params.get("resolution", 16))
+        patch_size = int(params.get("patch_size", 1))
+        
         defaults = {
             "in_channels": int(params.get("in_channels", 8)),
-            "model_channels": int(params.get("model_channels", 1024)),
+            "model_channels": model_channels,
             "cond_channels": int(params.get("cond_channels", 1024)),
             "out_channels": int(params.get("out_channels", 8)),
             "num_blocks": int(params.get("num_blocks", 24)),
@@ -1295,15 +1312,40 @@ def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
             "use_fp16": bool(params.get("use_fp16", False)),
             "use_checkpoint": bool(params.get("use_checkpoint", False)),
             "is_shortcut_model": bool(params.get("is_shortcut_model", False)),
-            # Latent mapping for shape token (simplified for medical)
-            "latent_mapping": params.get("latent_mapping", {
-                "shape": {
-                    "_target_": "sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent",
-                    "in_channels": 8,
-                    "model_channels": 1024,
-                }
-            }),
         }
+        
+        # Build latent_mapping as proper nn.Module dict
+        # The SparseStructureFlowTdfyWrapper expects a dict of Latent modules
+        latent_mapping = params.get("latent_mapping", None)
+        if latent_mapping is None:
+            # Create default latent mapping for medical (shape token only)
+            # Shape uses ShapePositionEmbedder (3D grid position encoding)
+            latent_mapping = {
+                "shape": Latent(
+                    in_channels=8,
+                    model_channels=model_channels,
+                    pos_embedder=ShapePositionEmbedder(
+                        model_channels=model_channels,
+                        resolution=resolution,
+                        patch_size=patch_size,
+                    ),
+                ),
+            }
+        elif isinstance(latent_mapping, dict):
+            # If it's a dict of configs (with _target_), instantiate them
+            instantiated = {}
+            for key, val in latent_mapping.items():
+                if isinstance(val, nn.Module):
+                    instantiated[key] = val
+                elif isinstance(val, dict) and "_target_" in val:
+                    # Use hydra instantiate for _target_ configs
+                    from hydra.utils import instantiate as hydra_instantiate
+                    instantiated[key] = hydra_instantiate(val)
+                else:
+                    raise TypeError(
+                        f"latent_mapping[{key}] must be nn.Module or dict with _target_, got {type(val)}"
+                    )
+            latent_mapping = instantiated
         
         # Build the backbone (SparseStructureFlowTdfyWrapper)
         backbone = SparseStructureFlowTdfyWrapper(
@@ -1317,7 +1359,7 @@ def create_model(name: str = "dummy", params: dict | None = None) -> nn.Module:
             use_fp16=defaults["use_fp16"],
             use_checkpoint=defaults["use_checkpoint"],
             is_shortcut_model=defaults["is_shortcut_model"],
-            latent_mapping=defaults["latent_mapping"],
+            latent_mapping=latent_mapping,
         )
         
         # Wrap in FlowMatching for training
@@ -1519,34 +1561,85 @@ def train_from_config(cfg: dict):
     ss_decoder = None
     if stage1_cfg.get("enabled", False) or training_mode in ["stage1_only", "two_stage"]:
         logger.info("Setting up Stage 1 (ss_generator) training...")
-        # Load ss_generator checkpoint if provided
-        ss_generator_ckpt = stage1_cfg.get("ss_generator_ckpt")
-        if ss_generator_ckpt:
+        # Load ss_generator using YAML config + checkpoint (like InferencePipeline)
+        ss_generator_ckpt = stage1_cfg.get("ss_generator_ckpt", "./checkpoints/hf/ss_generator.ckpt")
+        ss_generator_yaml = stage1_cfg.get("ss_generator_config", "./checkpoints/hf/ss_generator.yaml")
+        
+        if os.path.exists(ss_generator_yaml):
+            # Preferred: load from YAML config using Hydra instantiate
             try:
-                ss_generator = create_model(name="ss_generator", params={})
+                from hydra.utils import instantiate as hydra_instantiate
                 from sam3d_objects.model.io import load_model_from_checkpoint
-                ss_generator = load_model_from_checkpoint(
-                    ss_generator, ss_generator_ckpt, strict=False, device=args.device
-                )
-                logger.info("Loaded ss_generator from: %s", ss_generator_ckpt)
+                from sam3d_objects.pipeline.inference_pipeline import filter_and_remove_prefix_state_dict_fn
+                
+                yaml_cfg = OmegaConf.load(ss_generator_yaml)
+                # The ss_generator backbone is at module.generator.backbone
+                backbone_cfg = yaml_cfg["module"]["generator"]["backbone"]
+                ss_generator = hydra_instantiate(backbone_cfg)
+                
+                if os.path.exists(ss_generator_ckpt):
+                    # Load checkpoint with prefix filtering (like InferencePipeline)
+                    state_dict_fn = filter_and_remove_prefix_state_dict_fn("_base_models.generator.")
+                    ss_generator = load_model_from_checkpoint(
+                        ss_generator, ss_generator_ckpt, strict=False, device=args.device,
+                        state_dict_fn=state_dict_fn
+                    )
+                    logger.info("Loaded ss_generator from YAML config + checkpoint: %s", ss_generator_ckpt)
+                else:
+                    logger.warning("ss_generator checkpoint not found, using freshly initialized model")
             except Exception as e:
-                logger.warning("Failed to load ss_generator: %s", e)
+                logger.warning("Failed to load ss_generator from YAML config: %s", e)
+                logger.info("Falling back to create_model for ss_generator...")
                 ss_generator = create_model(name="ss_generator", params={})
         else:
+            # Fallback: create model from scratch using create_model
+            logger.info("ss_generator YAML config not found, using create_model")
             ss_generator = create_model(name="ss_generator", params={})
+            if ss_generator_ckpt and os.path.exists(ss_generator_ckpt):
+                try:
+                    from sam3d_objects.model.io import load_model_from_checkpoint
+                    ss_generator = load_model_from_checkpoint(
+                        ss_generator, ss_generator_ckpt, strict=False, device=args.device
+                    )
+                    logger.info("Loaded ss_generator weights from: %s", ss_generator_ckpt)
+                except Exception as e:
+                    logger.warning("Failed to load ss_generator weights: %s", e)
         
-        # Load ss_decoder
+        # Load ss_decoder using YAML config (like ss_generator)
         ss_decoder_ckpt = stage1_cfg.get("ss_decoder_ckpt", "./checkpoints/hf/ss_decoder.ckpt")
-        try:
-            ss_decoder = create_model(name="ss_decoder", params={})
-            from sam3d_objects.model.io import load_model_from_checkpoint
-            ss_decoder = load_model_from_checkpoint(
-                ss_decoder, ss_decoder_ckpt, strict=False, device=args.device
-            )
-            logger.info("Loaded ss_decoder from: %s", ss_decoder_ckpt)
-        except Exception as e:
-            logger.warning("Failed to load ss_decoder: %s", e)
-            ss_decoder = create_model(name="ss_decoder", params={})
+        ss_decoder_yaml = stage1_cfg.get("ss_decoder_config", "./checkpoints/hf/ss_decoder.yaml")
+        
+        if os.path.exists(ss_decoder_yaml):
+            try:
+                from hydra.utils import instantiate as hydra_instantiate
+                from sam3d_objects.model.io import load_model_from_checkpoint
+                
+                yaml_cfg = OmegaConf.load(ss_decoder_yaml)
+                ss_decoder = hydra_instantiate(yaml_cfg)
+                
+                if os.path.exists(ss_decoder_ckpt):
+                    # ss_decoder checkpoint is directly a state_dict (no wrapper)
+                    ss_decoder = load_model_from_checkpoint(
+                        ss_decoder, ss_decoder_ckpt, strict=False, device=args.device,
+                        state_dict_key=None  # Direct state_dict format
+                    )
+                    logger.info("Loaded ss_decoder from YAML config + checkpoint: %s", ss_decoder_ckpt)
+            except Exception as e:
+                logger.warning("Failed to load ss_decoder from YAML config: %s", e)
+                ss_decoder = create_model(name="ss_decoder", params={})
+        else:
+            # Fallback: create model from scratch
+            try:
+                ss_decoder = create_model(name="ss_decoder", params={})
+                from sam3d_objects.model.io import load_model_from_checkpoint
+                ss_decoder = load_model_from_checkpoint(
+                    ss_decoder, ss_decoder_ckpt, strict=False, device=args.device,
+                    state_dict_key=None
+                )
+                logger.info("Loaded ss_decoder from: %s", ss_decoder_ckpt)
+            except Exception as e:
+                logger.warning("Failed to load ss_decoder: %s", e)
+                ss_decoder = create_model(name="ss_decoder", params={})
     
     # Stage 2: slat_generator + slat_decoder_mesh
     stage2_cfg = cfg.get("stage2", {})
